@@ -1,0 +1,362 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── Packages ──
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+
+\geometry{margin=2.5cm}
+\hypersetup{colorlinks=true, linkcolor=blue!60!black, citecolor=blue!60!black, urlcolor=blue!60!black}
+
+% ── En-tête / pied de page ──
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Core-Satellite Quantitatif}
+\fancyhead[R]{\small\thepage}
+\fancyfoot[C]{\small \today}
+
+% ── Titre ──
+\title{\textbf{Construction d'un Portefeuille Core-Satellite} \\ 
+\large Frontière Efficiente, Métriques de Concentration \\ et Backtest Rolling Trimestriel}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\begin{abstract}
+Ce document présente la construction d'un portefeuille \textit{Core} composé de 3~ETFs couvrant les classes Equity, Rates et Credit. Partant de l'optimisation Moyenne-Variance classique (Markowitz), nous diagnostiquons le problème de concentration à l'aide de trois indicateurs complémentaires (HHI, Diversification Ratio, Max Risk Contribution), puis évaluons sept méthodes d'allocation alternatives. Un backtest rolling trimestriel valide les résultats en out-of-sample sur la période 2010--2025.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ══════════════════════════════════════════════════════════
+\section{Données et sélection des ETFs}
+% ══════════════════════════════════════════════════════════
+
+\subsection{Source des données}
+
+Les données proviennent d'un fichier Excel (\texttt{core\_ETF.xlsx}) contenant les prix journaliers d'un univers d'ETFs européens. Le fichier est structuré en colonnes paires (dates) et impaires (prix), avec trois lignes de métadonnées : tickers, buckets (classe d'actifs) et noms.
+
+\subsection{Sélection quantitative}
+
+Pour chaque thème d'investissement (Equity, Rates, Credit), on sélectionne l'ETF le plus représentatif via un score composite :
+\begin{equation}
+    \text{Score}_i = \bar{\rho}_i + 0{,}0001 \times n_{\text{obs},i} - 0{,}1 \times \sigma_i
+\end{equation}
+où $\bar{\rho}_i$ est la corrélation moyenne de l'ETF $i$ avec son bucket, $n_{\text{obs},i}$ la profondeur d'historique, et $\sigma_i$ sa volatilité journalière. Ce score équilibre représentativité, robustesse statistique et stabilité.
+
+\subsection{ETFs retenus}
+
+\begin{table}[H]
+\centering
+\caption{ETFs sélectionnés pour le portefeuille Core}
+\label{tab:etfs}
+\begin{tabular}{llll}
+\toprule
+\textbf{ETF} & \textbf{Classe} & \textbf{Bucket} & \textbf{Rôle} \\
+\midrule
+SWDA & Equity DM & Core & Moteur de rendement (actions mondiales) \\
+CBE3 & Rates EMU & Govies Bucket & Couverture duration (obligations d'État EUR) \\
+IEAC & Credit EMU & IG Core & Portage crédit investment-grade EUR \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+La période d'analyse couvre \textbf{2010--2025} avec environ 4\,040 observations journalières. Les rendements sont calculés en log-rendements :
+\begin{equation}
+    r_t = \ln\!\left(\frac{P_t}{P_{t-1}}\right)
+\end{equation}
+
+Les paramètres annualisés sont estimés sur l'ensemble de la période :
+\begin{equation}
+    \mu = \bar{r} \times 252, \qquad \Sigma = \text{Cov}(r) \times 252
+\end{equation}
+
+% ══════════════════════════════════════════════════════════
+\section{Frontière efficiente et optimisation Moyenne-Variance}
+% ══════════════════════════════════════════════════════════
+
+\subsection{Cadre théorique}
+
+L'optimisation Moyenne-Variance (Markowitz, 1952) cherche le portefeuille minimisant la volatilité pour un rendement cible $\mu^*$ :
+\begin{equation}
+    \min_{w} \quad \sigma_p = \sqrt{w^T \Sigma\, w}
+    \qquad \text{s.c.} \quad w^T \mu = \mu^*, \quad \sum_i w_i = 1, \quad w_i \geq 0
+\end{equation}
+
+En faisant varier $\mu^*$ sur l'intervalle des rendements atteignables, on trace la \textbf{frontière efficiente} : l'ensemble des portefeuilles offrant le meilleur compromis rendement/risque.
+
+\subsection{Portefeuilles remarquables}
+
+\begin{itemize}[nosep]
+    \item \textbf{Min-Variance} : $\arg\min_w \sqrt{w^T \Sigma\, w}$ — point le plus à gauche de la frontière.
+    \item \textbf{Max-Sharpe} (portefeuille tangent) : $\arg\max_w \frac{w^T\mu}{\sqrt{w^T \Sigma\, w}}$ — point de tangence avec la CML.
+\end{itemize}
+
+La \textbf{Capital Market Line} (CML) relie le taux sans risque $r_f = 0$ au portefeuille tangent :
+\begin{equation}
+    \mathbb{E}[r_p] = r_f + \frac{\mu_{\text{tan}} - r_f}{\sigma_{\text{tan}}} \cdot \sigma_p
+\end{equation}
+
+\subsection{Simulation Monte Carlo}
+
+Pour visualiser l'espace des portefeuilles atteignables, nous simulons 15\,000 portefeuilles aléatoires via une distribution de Dirichlet :
+\begin{equation}
+    w \sim \text{Dir}(\mathbf{1}_N), \qquad \text{soit} \quad w_i \geq 0, \quad \sum_i w_i = 1
+\end{equation}
+
+Ce nuage de points, coloré par Sharpe Ratio, est superposé à la frontière efficiente exacte obtenue par optimisation.
+
+\begin{figure}[H]
+    \centering
+    % \includegraphics[width=0.95\textwidth]{fig_frontiere_efficiente.png}
+    \caption{Frontière efficiente — 3~ETFs Core (SWDA, CBE3, IEAC). Les 7~méthodes d'allocation sont positionnées sur le graphique. Le nuage Monte Carlo (15\,000 portefeuilles) est coloré par Sharpe Ratio.}
+    \label{fig:frontier}
+\end{figure}
+
+% ══════════════════════════════════════════════════════════
+\section{Diagnostic de concentration}
+% ══════════════════════════════════════════════════════════
+
+L'optimisation classique (Min-Variance, Max-Sharpe) produit des portefeuilles \textbf{très concentrés} : CBE3 reçoit plus de 85\% du poids. Trois indicateurs complémentaires permettent de mesurer cette concentration sous différents angles.
+
+\subsection{HHI (Herfindahl-Hirschman Index)}
+
+Le HHI mesure la concentration \textit{des poids} :
+\begin{equation}
+    HHI = \sum_{i=1}^{N} w_i^2
+\end{equation}
+
+\begin{itemize}[nosep]
+    \item $HHI = 1/N \approx 0{,}333$ : portefeuille parfaitement équipondéré (diversification maximale des poids).
+    \item $HHI \to 1$ : portefeuille quasi mono-actif.
+\end{itemize}
+
+\subsection{Diversification Ratio (DR)}
+
+Le DR mesure l'exploitation des \textit{corrélations imparfaites} :
+\begin{equation}
+    DR = \frac{w^T \sigma}{\sigma_p} = \frac{\sum_i w_i \sigma_i}{\sqrt{w^T \Sigma\, w}}
+\end{equation}
+
+\begin{itemize}[nosep]
+    \item $DR = 1$ : aucun gain de diversification (corrélation parfaite ou mono-actif).
+    \item $DR > 1$ : le portefeuille bénéficie de la diversification. Plus $DR$ est élevé, mieux les corrélations sont exploitées.
+\end{itemize}
+
+\subsection{Max Risk Contribution (MaxRC)}
+
+Le MaxRC mesure la concentration \textit{du risque} (et non des poids) :
+\begin{equation}
+    RC_i = w_i \cdot \frac{(\Sigma\, w)_i}{\sigma_p}, \qquad MaxRC = \max_i \frac{RC_i}{\sum_j RC_j}
+\end{equation}
+
+\begin{itemize}[nosep]
+    \item $MaxRC = 1/N \approx 33\%$ : chaque actif contribue également au risque total.
+    \item Un portefeuille peut avoir des poids équilibrés mais un risque dominé par un seul actif (ex. : Equal-Weight avec un actif très volatil).
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    % \includegraphics[width=\textwidth]{fig_tradeoff_3metriques.png}
+    \caption{Trade-off Sharpe Ratio vs trois indicateurs de concentration (HHI, Diversification Ratio, Max Risk Contribution). Le nuage gris représente les 15\,000 portefeuilles simulés.}
+    \label{fig:tradeoff}
+\end{figure}
+
+% ══════════════════════════════════════════════════════════
+\section{Sept méthodes d'allocation}
+% ══════════════════════════════════════════════════════════
+
+\subsection{Méthodes classiques (non contraintes)}
+
+\paragraph{Min-Variance.}
+\begin{equation}
+    w^{\text{MV}} = \arg\min_w \sqrt{w^T \Sigma\, w} \qquad \text{s.c.} \quad \sum w_i = 1, \; w_i \geq 0
+\end{equation}
+Produit le portefeuille de volatilité minimale mais tend à concentrer sur l'actif le moins volatil.
+
+\paragraph{Max-Sharpe (portefeuille tangent).}
+\begin{equation}
+    w^{\text{MS}} = \arg\max_w \frac{w^T \mu}{\sqrt{w^T \Sigma\, w}} \qquad \text{s.c.} \quad \sum w_i = 1, \; w_i \geq 0
+\end{equation}
+Meilleur Sharpe théorique mais très sensible aux erreurs d'estimation de $\mu$.
+
+\subsection{Méthodes naïves}
+
+\paragraph{Equal-Weight.}
+\begin{equation}
+    w_i^{\text{EW}} = \frac{1}{N} \quad \forall i
+\end{equation}
+Simple et robuste, HHI minimal par construction, mais ignore toute information de risque et rendement.
+
+\paragraph{Inverse Volatility.}
+\begin{equation}
+    w_i^{\text{IV}} = \frac{1/\sigma_i}{\sum_j 1/\sigma_j}
+\end{equation}
+Surpondère les actifs moins volatils. Ignore les corrélations entre actifs.
+
+\subsection{Méthodes à objectif de diversification}
+
+\paragraph{Risk Parity.}
+Cherche à égaliser la contribution au risque de chaque actif :
+\begin{equation}
+    w^{\text{RP}} = \arg\min_w \sum_{i=1}^{N} \left(RC_i - \frac{\sigma_p}{N}\right)^2 \qquad \text{s.c.} \quad \sum w_i = 1, \; w_i \geq 0{,}01
+\end{equation}
+Assure un $MaxRC$ faible mais peut s'éloigner de la frontière efficiente.
+
+\paragraph{Max Diversification.}
+\begin{equation}
+    w^{\text{MD}} = \arg\max_w \frac{w^T \sigma}{\sqrt{w^T \Sigma\, w}} \qquad \text{s.c.} \quad \sum w_i = 1, \; w_i \geq 0{,}01
+\end{equation}
+Maximise le Diversification Ratio, exploitant au mieux les corrélations imparfaites.
+
+\subsection{Méthode hybride}
+
+\paragraph{Sharpe sous contrainte de poids (plafond 50\,\%).}
+\begin{equation}
+    w^{\text{SC}} = \arg\max_w \frac{w^T \mu}{\sqrt{w^T \Sigma\, w}} \qquad \text{s.c.} \quad \sum w_i = 1, \; 0{,}05 \leq w_i \leq 0{,}50
+\end{equation}
+Combine l'objectif de Sharpe maximal avec une contrainte de diversification minimale. Le plafond de 50\% empêche la concentration excessive tout en laissant à l'optimiseur une liberté suffisante.
+
+\begin{figure}[H]
+    \centering
+    % \includegraphics[width=\textwidth]{fig_poids_metriques.png}
+    \caption{Gauche : répartition des poids pour les 7~méthodes d'allocation. Droite : tableau des métriques comparées (Ret\%, Vol\%, Sharpe, HHI, DivRatio, MaxRC\%).}
+    \label{fig:weights}
+\end{figure}
+
+% ══════════════════════════════════════════════════════════
+\section{Résultats de l'analyse statique (full-sample)}
+% ══════════════════════════════════════════════════════════
+
+\subsection{Tableau comparatif}
+
+\begin{table}[H]
+\centering
+\caption{Comparaison des 7~méthodes — analyse statique full-sample (2010--2025)}
+\label{tab:static}
+\begin{tabular}{l*{6}{c}}
+\toprule
+\textbf{Méthode} & \textbf{Ret\%} & \textbf{Vol\%} & \textbf{Sharpe} & \textbf{HHI} & \textbf{DR} & \textbf{MaxRC\%} \\
+\midrule
+Min-Variance       & 0,81  & 1,41  & 0,573 & 0,799 & 1,31 & 88,7 \\
+Max-Sharpe         & 2,10  & 2,27  & 0,926 & 0,781 & 1,39 & 66,6 \\
+Equal-Weight       & 4,12  & 5,33  & 0,774 & 0,333 & 1,28 & 88,6 \\
+Risk Parity        & 1,78  & 2,80  & 0,637 & 0,408 & 1,51 & 54,2 \\
+Max Diversif.      & 1,38  & 1,78  & 0,774 & 0,564 & 1,66 & 36,4 \\
+Sharpe plaf.~50\%  & 3,98  & 4,87  & 0,818 & 0,383 & 1,27 & 92,8 \\
+Inv.~Volatility    & 1,43  & 1,87  & 0,766 & 0,536 & 1,65 & 34,8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Analyse du triangle d'incompatibilité}
+
+Les résultats révèlent un \textbf{triangle d'incompatibilité} entre trois objectifs :
+
+\begin{enumerate}[nosep]
+    \item \textbf{Performance (Sharpe)} : Max-Sharpe domine (0,926) mais avec HHI = 0,781.
+    \item \textbf{Diversification des poids (HHI)} : Equal-Weight minimise le HHI (0,333) mais le Sharpe est sous-optimal.
+    \item \textbf{Diversification du risque (MaxRC, DR)} : Inv.~Volatility et Max~Diversif.\ obtiennent les meilleurs MaxRC ($\approx 35\%$) et DR ($\approx 1{,}65$).
+\end{enumerate}
+
+Les méthodes intermédiaires (Risk Parity, Sharpe plaf.~50\%) offrent le meilleur \textbf{compromis} entre ces trois dimensions.
+
+% ══════════════════════════════════════════════════════════
+\section{Backtest rolling trimestriel}
+% ══════════════════════════════════════════════════════════
+
+\subsection{Méthodologie}
+
+L'analyse statique utilise les paramètres estimés sur toute la période, ce qui induit un \textit{look-ahead bias}. Le backtest rolling corrige ce biais :
+
+\begin{enumerate}[nosep]
+    \item \textbf{Fenêtre d'estimation} : $L = 252$ jours ouvrés (1~an glissant).
+    \item \textbf{Rebalancement} : tous les $\Delta = 63$ jours ($\approx$ 1~trimestre).
+    \item À chaque date de rebalancement $t_k$ :
+    \begin{itemize}[nosep]
+        \item On estime $\hat{\mu}_k$ et $\hat{\Sigma}_k$ sur la fenêtre $[t_k - L, \; t_k)$.
+        \item On calcule les poids optimaux $w_k$ selon la méthode choisie.
+        \item On applique $w_k$ au trimestre suivant $[t_k, \; t_k + \Delta)$ (\textit{out-of-sample}).
+    \end{itemize}
+\end{enumerate}
+
+La performance cumulée OOS est construite comme :
+\begin{equation}
+    V_t = \prod_{s=1}^{t} \left(1 + w_{k(s)}^T r_s\right)
+\end{equation}
+où $k(s)$ est l'indice du dernier rebalancement avant la date $s$.
+
+\subsection{Résultats OOS}
+
+\begin{table}[H]
+\centering
+\caption{Performance out-of-sample — rolling trimestriel (2011--2025, 60~rebalancements)}
+\label{tab:rolling}
+\begin{tabular}{l*{7}{c}}
+\toprule
+\textbf{Méthode} & \textbf{Ret\%} & \textbf{Vol\%} & \textbf{Sharpe} & \textbf{MaxDD} & \textbf{HHI} & \textbf{DR} & \textbf{MaxRC\%} \\
+\midrule
+Sharpe plaf.~50\% & 3,53  & 5,61  & 0,630 & $-$11,6\% & 0,434 & 1,32 & 82,4 \\
+Risk Parity        & 1,25  & 2,49  & 0,502 & $-$14,3\% & 0,454 & 1,56 & 50,8 \\
+Equal-Weight       & 4,08  & 5,33  & 0,765 & $-$13,3\% & 0,333 & 1,26 & 90,1 \\
+Inv.~Volatility    & 0,75  & 1,77  & 0,424 & $-$11,9\% & 0,588 & 1,69 & 36,4 \\
+Max Diversif.      & 0,77  & 1,66  & 0,461 & $-$11,2\% & 0,610 & 1,70 & 37,2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    % \includegraphics[width=\textwidth]{fig_rolling_backtest.png}
+    \caption{Backtest rolling trimestriel (2011--2025). Haut gauche : performance cumulée OOS. Haut droit : évolution des poids (Sharpe plaf.~50\%). Bas gauche : métriques de concentration dans le temps. Bas droit : tableau récapitulatif.}
+    \label{fig:rolling}
+\end{figure}
+
+\subsection{Analyse des résultats OOS}
+
+Le backtest sur 60~rebalancements confirme plusieurs enseignements :
+
+\begin{itemize}[nosep]
+    \item \textbf{Equal-Weight} obtient le meilleur Sharpe OOS (0,765), bénéficiant de l'exposition actions sur une période haussière (2010--2025).
+    \item \textbf{Sharpe plaf.~50\%} offre un bon compromis avec un Sharpe de 0,630 et un drawdown modéré ($-$11,6\%).
+    \item Les méthodes axées sur la diversification du risque (Inv.~Vol, Max~Diversif.) maintiennent un MaxRC très bas ($\approx 36$--$37\%$) mais au prix d'un rendement OOS faible.
+    \item Le \textbf{Risk Parity} subit le plus gros drawdown ($-$14,3\%), surpondérant les deux branches obligataires qui ont souffert en 2022.
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════
+\section{Conclusion et recommandation}
+% ══════════════════════════════════════════════════════════
+
+L'approche Core-Satellite avec 3~ETFs et l'optimisation Moyenne-Variance classique présente un problème structurel de \textbf{concentration excessive} :\ les méthodes Min-Variance et Max-Sharpe allouent plus de 85\% à CBE3 (govies EUR), ce qui est confirmé par les trois indicateurs (HHI $> 0{,}78$, MaxRC $> 66\%$, DR $< 1{,}4$).
+
+Sept méthodes d'allocation ont été comparées sur trois dimensions : performance (Sharpe), diversification des poids (HHI) et diversification du risque (DR, MaxRC). Les graphiques de trade-off montrent qu'aucune méthode ne domine simultanément sur les trois axes, révélant un \textbf{triangle d'incompatibilité}.
+
+L'allocation \textbf{Sharpe plafonnée à 50\%} constitue le meilleur compromis :
+\begin{itemize}[nosep]
+    \item Sharpe statique compétitif (0,818), second après Max-Sharpe.
+    \item HHI modéré (0,383) grâce à la contrainte de poids.
+    \item Performance OOS robuste confirmée par le backtest rolling (Sharpe 0,630, MaxDD $-$11,6\%).
+\end{itemize}
+
+Le \textbf{Risk Parity} reste une alternative valide pour les investisseurs privilégiant la stabilité du risque ($MaxRC \approx 50\%$, $DR \approx 1{,}56$), au prix d'un rendement plus faible.
+
+\vspace{1em}
+\noindent\textit{``La diversification est la seule chose gratuite en finance.''} — Harry Markowitz
+
+\end{document}
