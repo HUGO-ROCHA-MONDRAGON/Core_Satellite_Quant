@@ -1,0 +1,13 @@
+Core_Satellite_Quant/
+  data/
+    core_ETF.xlsx
+  outputs/
+    core_returns_monthly.csv
+    satellite_returns_monthly.csv
+    satellite_weights_monthly.csv
+  src/
+    core_pipeline.py
+    satellite_pipeline.py
+    portfolio_engine.py
+    attribution.py
+    metrics.py

@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-path = "core_ETF.xlsx"
+path = "../data/core_ETF.xlsx"
 sheet = 0
 
 meta = pd.read_excel(path, sheet_name=sheet, header=None, nrows=3)
