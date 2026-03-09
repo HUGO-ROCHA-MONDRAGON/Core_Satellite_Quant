@@ -6,7 +6,7 @@ Backtest OOS: 2021-01-01 → 2025-12-31
 
 Objectifs :
   - Frais totaux ≤ 80 bps/an
-  - Volatilité totale cible 4-15 %
+  - Volatilité totale cible 8-12 %
   - Poche Core 70-75 %  (rebalancement trimestriel sans réoptimisation)
   - Poche Satellite 25-30 %  (poids equal-weight 1/n)
   - Satellite : alpha > 0 vs Core, beta rolling 3 M ≈ 0
@@ -46,16 +46,14 @@ class FondConfig:
     w_core_max: float = 0.75
     w_sat_abs_max: float = 0.30
 
-    # ── Volatilité totale annualisée cible (relaxée) ───────────────────────────
-    vol_target_min: float = 0.04    # relaxé : satellite a une faible vol naturelle
-    vol_target_max: float = 0.15
+    # ── Volatilité totale annualisée cible ──────────────────────────────────
+    vol_target_min: float = 0.08
+    vol_target_max: float = 0.12
     vol_target_mid: float = 0.10
 
-    # ── Ajustement de risque global (levier) pour remonter la vol si trop basse
-    # Le scale est calibré sur la fenêtre 2019-2020 pour viser vol_target_mid,
-    # puis appliqué en OOS de manière constante (sans look-ahead).
-    portfolio_scale_min: float = 1.00
-    portfolio_scale_max: float = 3.00
+    # ── Pas de levier ─────────────────────────────────────────────────────────
+    # Exposition brute = 100 % (w_core + w_sat = 1.0), aucun scaling.
+    portfolio_scale: float = 1.00
 
     # ── Frais (bps/an) ────────────────────────────────────────────────────────
     fees_bps_max:         float = 80.0
@@ -63,7 +61,7 @@ class FondConfig:
     fees_sat_default_bps: float = 200.0   # défaut conservateur pour fees non renseignées
 
     # ── Beta max poche satellite vs Core ──────────────────────────────────────
-    beta_sat_max: float = 0.15
+    beta_sat_max: float = 0.25
 
     # ── Au moins ce poids (de la poche sat) pour chaque bloc ─────────────────
     min_weight_per_bloc: float = 0.05
@@ -360,6 +358,9 @@ def calculer_metriques(
     })
     annual_df.index = annual_df.index.year
 
+    # ── Corrélation OOS ─────────────────────────────────────────────────────
+    corr_core_sat = float(r_c.corr(r_s))
+
     return {
         # ── Portefeuille total ────────────────────────────────────────────────
         "vol_portfolio_ann":     vol_p,
@@ -379,6 +380,7 @@ def calculer_metriques(
         "beta_satellite_static": beta_s_static,
         "beta_sat_rolling_mean": beta_sat_roll_mean,
         "beta_sat_rolling_std":  beta_sat_roll_std,
+        "corr_core_satellite":   corr_core_sat,
         # ── Allocation ────────────────────────────────────────────────────────
         "w_core": w_core,
         "w_sat":  w_sat,
@@ -483,11 +485,13 @@ def main() -> None:
     )
     core_calib_aligned = aligned_calib["core"]
 
-    # Vérification beta calib
+    # Vérification beta + corrélation calib
     alpha_s_cal, beta_s_cal = _ols(sat_pocket_calib.values, core_calib_aligned.values)
+    corr_calib = float(core_calib_aligned.corr(sat_pocket_calib))
     print(f"\n  Vérification calib 2019-2020 :")
     print(f"    β satellite vs Core = {beta_s_cal:+.3f}  (cible |β| ≤ {cfg.beta_sat_max:.2f})")
     print(f"    α satellite (ann.)  = {(1+alpha_s_cal)**252-1:+.2%}")
+    print(f"    ρ(Core, Satellite)  = {corr_calib:+.3f}  (décorrélation structurelle)")
 
     # ── [5] Calibration de l'allocation w_core / w_sat ───────────────────────
     print("\n[3] Calibration de l'allocation Core / Satellite...")
@@ -507,42 +511,14 @@ def main() -> None:
           f"| Total: {vol_total_calib:.1%}  "
           f"(cible [{cfg.vol_target_min:.0%}, {cfg.vol_target_max:.0%}])")
 
-    # Si le mix Core/Satellite est structurellement trop peu volatil,
-    # on applique un levier global constant calibré en 2019-2020.
-    if vol_total_calib > 1e-9:
-        scale_total = cfg.vol_target_mid / vol_total_calib
-    else:
-        scale_total = cfg.portfolio_scale_max
+    # Pas de levier : exposition brute = 100 %
+    scale_total = cfg.portfolio_scale   # = 1.0
+    w_core_eff = w_core
+    w_sat_eff  = w_sat
 
-    # Cap additionnel: respecter le budget de frais total.
-    fees_arr_opt = fees_bps.reindex(sat_weights.index).fillna(cfg.fees_sat_default_bps).values
-    fees_sat_wavg = float(sat_weights.values @ fees_arr_opt)
-    fees_unscaled_bps = w_core * cfg.fees_core_bps + w_sat * fees_sat_wavg
-    if fees_unscaled_bps > 1e-9:
-        scale_cap_fees = cfg.fees_bps_max / fees_unscaled_bps
-    else:
-        scale_cap_fees = cfg.portfolio_scale_max
-
-    scale_total = float(np.clip(
-        scale_total,
-        cfg.portfolio_scale_min,
-        min(cfg.portfolio_scale_max, scale_cap_fees),
-    ))
-
-    gross_target = (w_core + w_sat) * scale_total
-    w_sat_eff_raw = w_sat * scale_total
-    w_sat_eff = min(w_sat_eff_raw, cfg.w_sat_abs_max)
-    # Si la poche satellite dépasse 30% après scale, on bascule l'excédent vers Core.
-    w_core_eff = gross_target - w_sat_eff
-    vol_total_calib_eff = vol_total_calib * scale_total
-
-    print(f"  Scale global (calib): ×{scale_total:.2f} "
-          f"(bornes [{cfg.portfolio_scale_min:.2f}, {cfg.portfolio_scale_max:.2f}])")
     print(f"  Exposition brute      Core {w_core_eff:.1%} | Satellite {w_sat_eff:.1%} "
-          f"| Total {w_core_eff + w_sat_eff:.1%}")
-    if w_sat_eff_raw > cfg.w_sat_abs_max + 1e-12:
-        print(f"  Cap Satellite actif   {w_sat_eff_raw:.1%} -> {w_sat_eff:.1%} (max {cfg.w_sat_abs_max:.0%})")
-    print(f"  Vol calib après scale: {vol_total_calib_eff:.1%}")
+          f"| Total {w_core_eff + w_sat_eff:.1%}  (pas de levier)")
+    print(f"  Vol calib : {vol_total_calib:.1%}")
 
     # ── [6] Frais estimés ─────────────────────────────────────────────────────
     fees_arr_opt    = fees_bps.reindex(sat_weights.index).fillna(cfg.fees_sat_default_bps).values
@@ -600,6 +576,12 @@ def main() -> None:
           f"(cible ≈ 0)")
     print(f"    Beta rolling 3M – σ  {metrics['beta_sat_rolling_std']:.3f}  "
           f"(stabilité : plus faible = mieux)")
+
+    # Corrélation réalisée OOS entre Core et Satellite
+    corr_oos = float(bt_df["core_ret"].corr(bt_df["sat_pocket_ret"]))
+    print(f"\n  DÉCORRÉLATION STRUCTURELLE (OOS)")
+    print(f"    ρ(Core, Satellite)   {corr_oos:+.3f}  "
+          f"({'✓ décorrélé' if abs(corr_oos) < 0.30 else '⚠ corrélation élevée'})")
 
     print(f"\n  FRAIS")
     print(f"    Total estimé         {metrics['fees_total_bps']:.1f} bps "

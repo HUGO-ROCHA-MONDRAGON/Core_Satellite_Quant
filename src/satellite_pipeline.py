@@ -117,8 +117,8 @@ class SatelliteConfig:
 
     # ── Filtre beta initial (vs core équipondéré des 3 ETF sélectionnés) ─
     beta_filter_window_days: int = 63
-    beta_filter_max_abs: float = 0.15
-    beta_filter_min_pass_ratio: float = 0.80
+    beta_filter_max_abs: float = 0.25
+    beta_filter_min_pass_ratio: float = 0.70
 
     # ── Sorties ───────────────────────────────────────────────────────────
     output_selected_csv: str = ""
@@ -167,14 +167,14 @@ def _build_default_blocs(project_root: Path) -> Dict[str, BlocConfig]:
             vol_max_default=0.10,
             vol_max_by_strategy={
                 "Neutre au marché":            0.08,
-                "CTA/futures gérés":           0.12,
+                "CTA/futures gérés":           0.18,
                 "Long Short":                  0.10,
                 "Equity Hedge":                0.10,
                 "Mené par les événements":     0.10,
                 "Multi-stratégie":             0.10,
             },
-            sharpe_min=0.0,
-            alpha_min_annual=-0.05,
+            sharpe_min=-0.3,
+            alpha_min_annual=-0.10,
             drawdown_max=-0.50,
             skew_min=-2.0,
             kurtosis_max=8.0,
