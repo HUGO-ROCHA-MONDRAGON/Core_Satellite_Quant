@@ -76,6 +76,20 @@ class CoreConfig:
     # exposition actions structurelle pour capter les primes de risque long terme.
     equity_weight_floor: float = 0.30
 
+    # ── Méthode d'optimisation rolling ──────────────────────────────────────
+    # Options : "risk_parity_tilt" | "min_var" | "max_sharpe" (legacy)
+    rolling_method: str = "risk_parity_tilt"
+
+    # ── Tilt Equity dynamique (pour rolling_method = "risk_parity_tilt") ────
+    # Si momentum rolling Equity > momentum_threshold → poids Equity = equity_weight_ceiling
+    # Sinon → poids Equity = equity_weight_floor (déjà existant)
+    equity_weight_ceiling: float = 0.60   # poids max Equity en régime haussier
+    momentum_window: int = 252            # fenêtre momentum Equity (jours)
+    momentum_threshold: float = 0.0       # seuil : rendement 12M > 0 → régime haussier
+
+    # ── Shrinkage covariance ─────────────────────────────────────────────────
+    use_ledoit_wolf: bool = True           # Ledoit-Wolf si sklearn disponible
+
     # ── Fenêtres IS / OOS ────────────────────────
     oos_start: str = "2021-01-01"
     oos_end: str = "2025-12-31"
@@ -291,7 +305,8 @@ def pick_best_theme(
 ) -> str:
     """
     Sélection du meilleur ETF pour un thème donné.
-    Score = corrélation moyenne intra-thème + bonus obs − pénalité vol.
+    Score = Sharpe annualisé sur la fenêtre IS [score_start, score_end].
+    Critère économiquement interprétable, sans regard sur données OOS.
     """
     cands = [t for t in wide.columns
              if t in rets_log_calib.columns
@@ -303,17 +318,58 @@ def pick_best_theme(
     if len(cands) == 1:
         return cands[0]
 
-    R = rets_log_calib[cands].dropna(how="all")
-    corr = R.corr()
-    avg_corr = corr.mean(axis=1).values
-    obs = np.array([rets_log_calib[t].dropna().shape[0] for t in cands], dtype=float)
-    vol = R.std().values
+    scores = {}
+    for t in cands:
+        r = rets_log_calib[t].dropna()
+        mu_ann = r.mean() * 252
+        vol_ann = r.std() * np.sqrt(252)
+        sharpe = mu_ann / vol_ann if vol_ann > 1e-10 else -np.inf
+        scores[t] = sharpe
 
-    obs_z = (obs - obs.mean()) / (obs.std() + 1e-12)
-    vol_z = (vol - vol.mean()) / (vol.std() + 1e-12)
+    best = max(scores, key=scores.get)
+    print(f"    {theme_name} scores (Sharpe IS): " +
+          ", ".join(f"{t}={v:.2f}" for t, v in sorted(scores.items(), key=lambda x: -x[1])))
+    return best
 
-    score = avg_corr + 0.10 * obs_z - 0.10 * vol_z
-    return cands[int(np.argmax(score))]
+
+def _risk_parity_weights(cov: np.ndarray, w_min: float, w_max: float) -> np.ndarray:
+    """
+    Poids Risk Parity (∝ 1/vol individuelle), clipés dans [w_min, w_max].
+    Pas de dépendance à μ → robuste OOS.
+    """
+    vols = np.sqrt(np.diag(cov))
+    inv_vol = 1.0 / (vols + 1e-12)
+    w = inv_vol / inv_vol.sum()
+    w = np.clip(w, w_min, w_max)
+    w /= w.sum()
+    return w
+
+
+def _ledoit_wolf_cov(window_rets: np.ndarray) -> np.ndarray:
+    """
+    Estime la matrice de covariance annualisée par Ledoit-Wolf shrinkage.
+    Fallback vers la covariance empirique si sklearn indisponible.
+    """
+    try:
+        from sklearn.covariance import LedoitWolf
+        lw = LedoitWolf().fit(window_rets)
+        return lw.covariance_ * 252
+    except ImportError:
+        return np.cov(window_rets.T) * 252
+
+
+def _opt_min_var_contraint(cov: np.ndarray, w_min: float, w_max: float) -> np.ndarray:
+    """Min Variance sous contraintes [w_min, w_max] – ne dépend pas de μ."""
+    n = cov.shape[0]
+    x0 = np.ones(n) / n
+
+    def port_var(w: np.ndarray) -> float:
+        return float(w @ cov @ w)
+
+    bounds = [(w_min, w_max)] * n
+    cons = {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
+    res = minimize(port_var, x0, method="SLSQP", bounds=bounds, constraints=cons)
+    return res.x if res.success else x0
 
 
 def optimiser_max_sharpe_contraint(mu: np.ndarray, cov: np.ndarray, w_min: float, w_max: float) -> np.ndarray:
@@ -343,11 +399,23 @@ def backtest_rolling(
     oos_end: str | None = None,
     label: str = "OOS",
     equity_floor: float = 0.0,
+    equity_ceiling: float = 0.0,
+    momentum_window: int = 252,
+    momentum_threshold: float = 0.0,
+    rolling_method: str = "risk_parity_tilt",
+    use_ledoit_wolf: bool = True,
 ) -> pd.Series:
     """
-    Backtest rolling trimestriel (Max Sharpe contraint).
-    Si equity_floor > 0, le poids de la colonne 0 (Equity) est forcé
-    au minimum à cette valeur après optimisation (redistribution pro-rata).
+    Backtest rolling trimestriel.
+
+    rolling_method :
+      - "risk_parity_tilt" : Risk Parity (1/vol) + tilt Equity momentum dynamique.
+        Si equity_ceiling > 0 et momentum Equity > momentum_threshold → w[0] augmenté
+        jusqu'à equity_ceiling. Sinon equity_floor appliqué si défini.
+      - "min_var"          : Min Variance sous bornes [w_min, w_max].
+      - "max_sharpe"       : Max Sharpe avec μ historique (comportement legacy).
+
+    Si use_ledoit_wolf=True, la covariance est estimée par Ledoit-Wolf shrinkage.
     """
     rets_log = np.log(prices).diff().dropna()
     dates = rets_log.index
@@ -359,21 +427,46 @@ def backtest_rolling(
         window = rets_log.iloc[start - lookback:start]
         oos = rets_log.iloc[start:start + rebal_freq]
 
-        mu = window.mean().values * 252
-        cov = window.cov().values * 252
+        # ── Estimation de la covariance ───────────────────────────────────
+        if use_ledoit_wolf:
+            cov = _ledoit_wolf_cov(window.values)
+        else:
+            cov = window.cov().values * 252
 
-        w = optimiser_max_sharpe_contraint(mu, cov, w_min, w_max)
+        # ── Calcul des poids selon la méthode choisie ─────────────────────
+        if rolling_method == "risk_parity_tilt":
+            w = _risk_parity_weights(cov, w_min, w_max)
 
-        # Appliquer le floor Equity si nécessaire
+            # Tilt haussier : si momentum Equity > seuil, augmenter w[0]
+            mom_start = max(0, start - momentum_window)
+            equity_rets = rets_log.iloc[mom_start:start].iloc[:, 0]
+            equity_momentum = float(equity_rets.sum())  # rendement log cumulé
+            if equity_ceiling > 0 and equity_momentum > momentum_threshold and w[0] < equity_ceiling:
+                tilt_target = equity_ceiling
+                excess = tilt_target - w[0]
+                w[0] = tilt_target
+                others_sum = w[1:].sum()
+                if others_sum > 1e-12:
+                    w[1:] -= excess * (w[1:] / others_sum)
+                w = np.clip(w, w_min, w_max)
+                w /= w.sum()
+
+        elif rolling_method == "min_var":
+            w = _opt_min_var_contraint(cov, w_min, w_max)
+
+        else:  # "max_sharpe" (legacy)
+            mu = window.mean().values * 252
+            w = optimiser_max_sharpe_contraint(mu, cov, w_min, w_max)
+
+        # ── Appliquer le floor Equity si nécessaire ───────────────────────
         if equity_floor > 0 and w[0] < equity_floor:
             deficit = equity_floor - w[0]
             w[0] = equity_floor
-            # Redistribuer le déficit pro-rata sur les autres actifs
             others_sum = w[1:].sum()
             if others_sum > 1e-12:
                 w[1:] -= deficit * (w[1:] / others_sum)
             w = np.clip(w, w_min, w_max)
-            w /= w.sum()  # re-normaliser
+            w /= w.sum()
 
         oos_port = oos.values @ w
         port_log_rets.extend(oos_port.tolist())
@@ -418,7 +511,11 @@ def main() -> None:
     print(f"  Fichier : {Path(cfg.core_excel).name}")
     print(f"  IS (sélection + calib) : {cfg.score_start} → {cfg.score_end}")
     print(f"  OOS (validation)       : {cfg.oos_start} → {cfg.oos_end}")
+    print(f"  Méthode rolling        : {cfg.rolling_method}")
+    print(f"  Ledoit-Wolf shrinkage  : {cfg.use_ledoit_wolf}")
     print(f"  Equity weight floor    : {cfg.equity_weight_floor:.0%}")
+    print(f"  Equity weight ceiling  : {cfg.equity_weight_ceiling:.0%}")
+    print(f"  Momentum window        : {cfg.momentum_window} jours | seuil : {cfg.momentum_threshold}")
     print("=" * 60)
 
     # ── 1) Lecture + filtrage des 3 thèmes ────────────────────────────────
@@ -476,7 +573,9 @@ def main() -> None:
     print(f"  -> {etf_log_path}")
 
     # ── 5) Backtest rolling : IS (2019-2020) + OOS (2021-2025) ─────────
-    print(f"\n[5/7] Backtest rolling (Max Sharpe contraint)...")
+    lw_tag = "+LW" if cfg.use_ledoit_wolf else ""
+    method_label = f"{cfg.rolling_method}{lw_tag}"
+    print(f"\n[5/7] Backtest rolling ({method_label})...")
 
     # IS : sélection et calibration sur 2019-2020
     print(f"\n  --- IS ({cfg.score_start} → {cfg.score_end}) ---")
@@ -490,8 +589,13 @@ def main() -> None:
         oos_end=cfg.score_end,
         label="IS",
         equity_floor=cfg.equity_weight_floor,
+        equity_ceiling=cfg.equity_weight_ceiling,
+        momentum_window=cfg.momentum_window,
+        momentum_threshold=cfg.momentum_threshold,
+        rolling_method=cfg.rolling_method,
+        use_ledoit_wolf=cfg.use_ledoit_wolf,
     )
-    _print_perf_summary(core_log_daily_is, "IS")
+    _print_perf_summary(core_log_daily_is, f"IS [{method_label}]")
 
     core_log_daily_is.to_frame().to_csv(cfg.output_core_daily_is_csv, index=True)
     print(f"    -> {cfg.output_core_daily_is_csv}")
@@ -508,8 +612,13 @@ def main() -> None:
         oos_end=cfg.oos_end,
         label="OOS",
         equity_floor=cfg.equity_weight_floor,
+        equity_ceiling=cfg.equity_weight_ceiling,
+        momentum_window=cfg.momentum_window,
+        momentum_threshold=cfg.momentum_threshold,
+        rolling_method=cfg.rolling_method,
+        use_ledoit_wolf=cfg.use_ledoit_wolf,
     )
-    _print_perf_summary(core_log_daily_oos, "OOS")
+    _print_perf_summary(core_log_daily_oos, f"OOS [{method_label}]")
 
     core_log_daily_oos.to_frame().to_csv(cfg.output_core_daily_csv, index=True)
     print(f"    -> {cfg.output_core_daily_csv}")
