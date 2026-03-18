@@ -1,5 +1,5 @@
 """
-Pipeline Satellite v2 – Filtrage 4 niveaux + scoring + sélection.
+Pipeline Satellite v3 – Shortlist 19 fonds, filtres IS renforcés, scoring décorrélation-first.
 
 Sources :
   - STRAT1/2/3_info.xlsx  : métadonnées Bloomberg (AUM, frais, stratégie, etc.)
@@ -13,21 +13,27 @@ Structure des 3 blocs :
   Bloc 2 – Alpha avec bêta contrôlé   : CTA, Equity Hedge, L/S, Market Neutral…
   Bloc 3 – Diversification macro      : Commodités, ILS, ARP, Relative Value…
 
+Shortlist qualitative : 9 fonds pré-sélectionnés (SATELLITE_SHORTLIST) restreignent
+  l'univers avant tout filtre quantitatif.
+
 Pipeline de filtrage (toutes métriques calculées sur la fenêtre calib 2019-2020) :
-    Niveau Beta – Filtre initial      : rolling beta 3 mois vs Core équipondéré,
-                         |beta| <= 15% sur au moins 80% des jours d'analyse
+    Niveau Beta – Filtre initial renforcé : rolling beta 3 mois vs Core équipondéré,
+                         median(|beta|) <= 35%, q75(|beta|) <= 55%,
+                         |beta| <= 35% sur au moins 80% des jours IS
   Niveau 0 – Structurel universel : AUM ≥ 100 M$, premier prix ≤ 01/01/2019,
              filtre devise (optionnel), exclusion de stratégies (optionnel)
-  Niveau 1 – Frais & Volatilité    : plafonds par bloc/stratégie
-  Niveau 2 – Qualité quantitative  : Sharpe, Alpha vs Core, Max Drawdown
-  Niveau 3 – Comportemental        : Skewness, Kurtosis (sur prix calib),
-                                      Concentration (info Bloomberg)
+  Niveau 1 – Frais, Volatilité & Stale pricing (seuil global 10%, spécifique par ticker)
+  Niveau 2 – Qualité quantitative + filtre corrélation IS (corr_core_calib <= 45%)
+  Niveau 3 – Comportemental : Skewness, Kurtosis, Concentration
+  Filtre pairwise – Cohérence inter-fonds sélectionnés (corr pairwise IS <= 70%)
 
-Score composite (z-scoré intra-bloc, calculé sur calib window 2019-2020) :
-  Sharpe(30%) + (-|β_core|)(35%) + Alpha(20%) + (-Drawdown)(10%)
-  + Skewness(3%) + (-Kurtosis)(2%)
+Score composite décorrélation-first (z-scoré intra-bloc, calib window 2019-2020) :
+  -|β_core|(30%) + -corr_core(10%) + Sortino(25%) + ret_rel_covid(15%)
+  + -dd_covid(10%) + Skewness(5%) + -Kurtosis(5%)
 
-Sélection finale : 3 fonds par bloc, max 2 par stratégie.
+Sélection finale : 2+3+2 fonds (Bloc1+Bloc2+Bloc3), max 2 par stratégie + filtre pairwise.
+Réserves : 2 fonds suivants par bloc exportés dans satellite_reserves.csv.
+Export enrichi : satellite_selected_v3.csv avec métriques COVID et corrélation IS.
 Anti look-ahead : tous les calculs quantitatifs sur la fenêtre 2019-2020 uniquement.
 """
 
@@ -35,6 +41,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
+import logging
 import os
 import unicodedata
 
@@ -49,12 +56,32 @@ from scipy import stats
 # ══════════════════════════════════════════════════════════════════════════════
 
 SCORE_WEIGHTS: Dict[str, float] = {
-    "sharpe":        0.30,
-    "neg_abs_beta":  0.35,   # bas beta vs core = bonne décorrélation
-    "alpha":         0.20,   # alpha vs core (annualisé)
-    "neg_drawdown":  0.10,   # moins négatif = mieux
-    "skew":          0.03,   # légère préférence positive
-    "neg_kurtosis":  0.02,   # moins de fat tails = mieux
+    "neg_abs_beta":   0.30,   # décorrélation : bas beta vs core
+    "neg_corr_core":  0.10,   # décorrélation : corrélation IS
+    "sortino":        0.25,   # régularité risk-adjusted
+    "ret_rel_covid":  0.15,   # résistance crise mars 2020
+    "neg_dd_covid":   0.10,   # drawdown pendant COVID (moins négatif = mieux)
+    "skew":           0.05,   # légère préférence positive
+    "neg_kurtosis":   0.05,   # moins de fat tails = mieux
+}
+
+# ── Shortlist qualitative des 19 fonds satellite pré-sélectionnés ─────────────
+SATELLITE_SHORTLIST: Dict[str, List[str]] = {
+    "Bloc1": [
+        "DWMAEIA ID Equity",
+        "FINVPRI GR Equity",
+    ],
+    "Bloc2": [
+        "HFHPERC LX Equity",
+        "EXCREISA LX Equity",
+        "MSEMNA LX Equity",
+        "LIOFVS1 LX Equity",
+        "BRSCSAA LX Equity",
+    ],
+    "Bloc3": [
+        "AEABSIA ID Equity",
+        "JPMILVX LX Equity",
+    ],
 }
 
 
@@ -125,12 +152,30 @@ class SatelliteConfig:
 
     # ── Filtre beta initial (vs core équipondéré des 3 ETF sélectionnés) ─
     beta_filter_window_days: int = 63
-    beta_filter_max_abs: float = 0.25
-    beta_filter_min_pass_ratio: float = 0.70
+    beta_filter_max_abs: float = 0.35
+    beta_filter_min_pass_ratio: float = 0.80
+    beta_filter_q75_max: float = 0.55
 
     # ── Qualité de cotation (stale pricing) ─────────────────────────────
     # Exclut les fonds trop souvent inchangés en business days sur calib.
-    stale_max_ratio: float = 0.35
+    stale_max_ratio: float = 0.10
+    # Seuil spécifique par ticker (prioritaire sur le seuil global).
+    # LIOFVS1 LX Equity : valorisation mensuelle → seuil strict à 5%.
+    stale_max_ratio_by_ticker: Dict[str, float] = field(
+        default_factory=lambda: {"LIOFVS1 LX Equity": 0.05}
+    )
+
+    # ── Filtre corrélation IS ─────────────────────────────────────────────
+    corr_is_max: float = 0.45
+
+    # ── Filtre cohérence pairwise (post-scoring) ──────────────────────────
+    corr_pairwise_is_max: float = 0.70
+
+    # ── Shortlist qualitative ─────────────────────────────────────────────
+    use_shortlist: bool = True
+    satellite_shortlist: Dict[str, List[str]] = field(
+        default_factory=lambda: SATELLITE_SHORTLIST
+    )
 
     # ── Sorties ───────────────────────────────────────────────────────────
     output_selected_csv: str = ""
@@ -170,7 +215,7 @@ def _build_default_blocs(project_root: Path) -> Dict[str, BlocConfig]:
             skew_min=-2.0,
             kurtosis_max=10.0,
             concentration_max=95.0,
-            n_select=3,
+            n_select=2,
             max_per_strategy=2,
         ),
         "Bloc2": BlocConfig(
@@ -225,7 +270,7 @@ def _build_default_blocs(project_root: Path) -> Dict[str, BlocConfig]:
             skew_min=-2.5,
             kurtosis_max=10.0,
             concentration_max=90.0,
-            n_select=3,
+            n_select=2,
             max_per_strategy=2,
         ),
     }
@@ -438,13 +483,19 @@ def calculer_metriques_calib(
 ) -> pd.DataFrame:
     """
     Calcule pour chaque fonds (sur calib window uniquement) :
-    vol, sharpe, alpha_annual, beta_core, drawdown, skewness, kurtosis.
+    vol, sharpe, sortino, alpha_annual, beta_core, corr_core_calib,
+    drawdown, skewness, kurtosis, dd_covid, ret_rel_covid.
     """
     log_rets = np.log(wide_prices).diff().dropna(how="all")
     rets_calib = log_rets.loc[calib_start:calib_end]
     core_calib = core_rets.loc[calib_start:calib_end]
 
     bday_idx = pd.date_range(calib_start, calib_end, freq="B")
+
+    # Fenêtre COVID (dans la calib window → pas de look-ahead)
+    covid_start = "2020-02-01"
+    covid_end = "2020-05-31"
+    core_covid = core_rets.loc[covid_start:covid_end]
 
     rows = []
     for ticker in rets_calib.columns:
@@ -459,17 +510,53 @@ def calculer_metriques_calib(
         stale_ratio = float(stale_mask.mean()) if len(stale_mask) else np.nan
 
         alpha, beta = _ols_alpha_beta(s, core_calib)
+
+        # Corrélation IS fonds vs core benchmark
+        aligned_corr = pd.concat([s, core_calib], axis=1).dropna()
+        if len(aligned_corr) >= 30:
+            corr_core = float(aligned_corr.iloc[:, 0].corr(aligned_corr.iloc[:, 1]))
+        else:
+            corr_core = np.nan
+
+        # Sortino ratio IS
+        ann_ret_s = float((1 + s).prod() ** (252 / len(s)) - 1) if len(s) > 0 else np.nan
+        downside = s[s < 0]
+        if len(downside) >= 5:
+            downside_vol = float(downside.std() * np.sqrt(252))
+            sortino = ann_ret_s / downside_vol if downside_vol > 1e-10 else np.nan
+        else:
+            sortino = np.nan
+
+        # Métriques COVID (fenêtre fixe dans calib → pas de look-ahead)
+        s_covid = log_rets[ticker].loc[covid_start:covid_end].dropna()
+        if len(s_covid) >= 10:
+            dd_covid = _max_drawdown(s_covid)
+            aligned_covid = pd.concat([s_covid, core_covid], axis=1).dropna()
+            if len(aligned_covid) >= 5:
+                ret_fund_covid = float((1 + aligned_covid.iloc[:, 0]).prod() - 1)
+                ret_core_covid = float((1 + aligned_covid.iloc[:, 1]).prod() - 1)
+                ret_rel_covid = ret_fund_covid - ret_core_covid
+            else:
+                ret_rel_covid = np.nan
+        else:
+            dd_covid = np.nan
+            ret_rel_covid = np.nan
+
         rows.append(dict(
             ticker=ticker,
             vol_calib=_annualized_vol(s),
             sharpe_calib=_annualized_sharpe(s),
+            sortino_calib=sortino,
             alpha_annual=alpha,
             beta_core=beta,
+            corr_core_calib=corr_core,
             drawdown_calib=_max_drawdown(s),
             skew_calib=float(stats.skew(s)),
             kurtosis_calib=float(stats.kurtosis(s)),   # excess kurtosis
             n_obs_calib=len(s),
             stale_ratio_calib=stale_ratio,
+            dd_covid=dd_covid,
+            ret_rel_covid=ret_rel_covid,
         ))
 
     return pd.DataFrame(rows).set_index("ticker")
@@ -571,9 +658,11 @@ def filtrer_niveau_beta_initial(
     cfg: SatelliteConfig,
 ) -> List[str]:
     """
-    Filtre initial beta : conserve les fonds dont le beta rolling 3M vs core équipondéré
-    respecte |beta| <= beta_filter_max_abs sur au moins beta_filter_min_pass_ratio
-    des jours dans la fenêtre d'analyse.
+    Filtre initial beta renforcé : conserve les fonds dont le beta rolling 3M vs core
+    respecte simultanément les 3 conditions suivantes sur la fenêtre calib IS :
+      1. median(|beta_rolling|) <= beta_filter_max_abs
+      2. quantile_75(|beta_rolling|) <= beta_filter_q75_max
+      3. ratio de jours où |beta_rolling| <= beta_filter_max_abs >= beta_filter_min_pass_ratio
     """
     valid: List[str] = []
     beta_window = beta_rolling.loc[cfg.calib_start:cfg.calib_end]
@@ -584,8 +673,15 @@ def filtrer_niveau_beta_initial(
         s = beta_window[ticker].dropna()
         if len(s) == 0:
             continue
-        pass_ratio = float((s.abs() <= cfg.beta_filter_max_abs).mean())
-        if pass_ratio >= cfg.beta_filter_min_pass_ratio:
+        abs_beta = s.abs()
+        median_beta = float(abs_beta.median())
+        q75_beta = float(abs_beta.quantile(0.75))
+        pass_ratio = float((abs_beta <= cfg.beta_filter_max_abs).mean())
+        if (
+            median_beta <= cfg.beta_filter_max_abs
+            and q75_beta <= cfg.beta_filter_q75_max
+            and pass_ratio >= cfg.beta_filter_min_pass_ratio
+        ):
             valid.append(ticker)
     return valid
 
@@ -625,7 +721,9 @@ def filtrer_niveau1(
             continue
 
         stale = metrics.at[ticker, "stale_ratio_calib"] if "stale_ratio_calib" in metrics.columns else np.nan
-        if not np.isnan(stale) and stale > cfg.stale_max_ratio:
+        # stale_max_ratio_by_ticker prend la priorité sur le seuil global
+        stale_threshold = cfg.stale_max_ratio_by_ticker.get(ticker, cfg.stale_max_ratio)
+        if not np.isnan(stale) and stale > stale_threshold:
             continue
 
         valid.append(ticker)
@@ -636,12 +734,14 @@ def filtrer_niveau2(
     tickers: List[str],
     metrics: pd.DataFrame,
     bloc_cfg: BlocConfig,
+    cfg: SatelliteConfig | None = None,
 ) -> List[str]:
     """
     Niveau 2 – Qualité quantitative (sur calib window) :
       - Sharpe ≥ sharpe_min
       - Alpha annualisé vs Core ≥ alpha_min_annual
       - Max drawdown ≥ drawdown_max  (ex: -0.80)
+      - Corrélation IS vs core ≤ corr_is_max (si cfg fourni)
     """
     valid = []
     for ticker in tickers:
@@ -654,6 +754,10 @@ def filtrer_niveau2(
             continue
         if not np.isnan(row["drawdown_calib"]) and row["drawdown_calib"] < bloc_cfg.drawdown_max:
             continue
+        if cfg is not None and "corr_core_calib" in metrics.columns:
+            corr = row.get("corr_core_calib", np.nan)
+            if not np.isnan(corr) and corr > cfg.corr_is_max:
+                continue
         valid.append(ticker)
     return valid
 
@@ -708,18 +812,21 @@ def scorer(
 ) -> pd.Series:
     """
     Score composite intra-bloc (z-scoré) basé sur les métriques calib window.
+    Décorrélation-first : neg_abs_beta(30%) + neg_corr_core(10%) + sortino(25%)
+    + ret_rel_covid(15%) + neg_dd_covid(10%) + skew(5%) + neg_kurtosis(5%).
     """
     df = metrics.loc[[t for t in tickers if t in metrics.index]].copy()
     if df.empty:
         return pd.Series(dtype=float)
 
     score = (
-        weights.get("sharpe", 0.30)        * _zscore_col(df["sharpe_calib"])
-      + weights.get("neg_abs_beta", 0.35)  * _zscore_col(-df["beta_core"].abs())
-      + weights.get("alpha", 0.20)         * _zscore_col(df["alpha_annual"])
-      + weights.get("neg_drawdown", 0.10)  * _zscore_col(-df["drawdown_calib"])
-      + weights.get("skew", 0.03)          * _zscore_col(df["skew_calib"])
-      + weights.get("neg_kurtosis", 0.02)  * _zscore_col(-df["kurtosis_calib"])
+        weights.get("neg_abs_beta", 0.30)   * _zscore_col(-df["beta_core"].abs())
+      + weights.get("neg_corr_core", 0.10)  * _zscore_col(-df["corr_core_calib"])
+      + weights.get("sortino", 0.25)        * _zscore_col(df["sortino_calib"])
+      + weights.get("ret_rel_covid", 0.15)  * _zscore_col(df["ret_rel_covid"])
+      + weights.get("neg_dd_covid", 0.10)   * _zscore_col(-df["dd_covid"])
+      + weights.get("skew", 0.05)           * _zscore_col(df["skew_calib"])
+      + weights.get("neg_kurtosis", 0.05)   * _zscore_col(-df["kurtosis_calib"])
     )
     return score.sort_values(ascending=False)
 
@@ -753,6 +860,64 @@ def selectionner(
     return selected
 
 
+def filtrer_coherence_pairwise(
+    tickers_ranked: List[str],
+    wide_prices_calib: pd.DataFrame,
+    n_select: int,
+    corr_max: float,
+) -> Tuple[List[str], List[str]]:
+    """
+    Filtre de cohérence pairwise (post-scoring, avant sélection finale).
+
+    Prend les tickers dans l'ordre du score décroissant, construit la liste
+    finale de manière greedy :
+      - Ajoute le ticker si sa corrélation IS avec tous les déjà-sélectionnés
+        est <= corr_max.
+      - Sinon skip.
+    Continue jusqu'à n_select fonds ou épuisement de la liste.
+
+    Retourne (selected, reserves) où reserves contient les 2 fonds suivants
+    qui auraient été sélectionnés si n_select était plus grand.
+    """
+    log_rets = np.log(wide_prices_calib).diff().dropna(how="all")
+
+    selected: List[str] = []
+    reserves: List[str] = []
+    n_reserves = 2
+
+    for ticker in tickers_ranked:
+        if ticker not in log_rets.columns:
+            continue
+        s = log_rets[ticker].dropna()
+        if len(s) < 10:
+            continue
+
+        # Vérifie la corrélation pairwise avec les déjà-sélectionnés
+        ok = True
+        for t_sel in selected:
+            if t_sel not in log_rets.columns:
+                continue
+            aligned = pd.concat([s, log_rets[t_sel].dropna()], axis=1).dropna()
+            if len(aligned) < 10:
+                continue
+            corr_val = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+            if abs(corr_val) > corr_max:
+                ok = False
+                break
+
+        if len(selected) < n_select:
+            if ok:
+                selected.append(ticker)
+            # (skipped if corr too high — next ticker takes its place)
+        elif len(reserves) < n_reserves:
+            if ok:
+                reserves.append(ticker)
+        else:
+            break
+
+    return selected, reserves
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Pipeline par bloc + pipeline principal
 # ══════════════════════════════════════════════════════════════════════════════
@@ -763,10 +928,10 @@ def traiter_bloc(
     core_rets: pd.Series,
     core_eqw_rets: pd.Series,
     cfg: SatelliteConfig,
-) -> Tuple[List[str], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[List[str], pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
     """
-    Traite un bloc complet : lecture → calibration → filtrage 4 niveaux → score → sélection.
-    Retourne (selected_tickers, metrics_df, info_df, beta_rolling_df).
+    Traite un bloc complet : lecture → shortlist → calibration → filtrage → score → sélection.
+    Retourne (selected_tickers, metrics_df, info_df, beta_rolling_df, reserves).
     """
     print(f"\n{'=' * 60}")
     print(f"  {bloc_cfg.nom}")
@@ -779,18 +944,34 @@ def traiter_bloc(
     prices = prices[common]
     print(f"  [données] {len(common)} fonds avec prix ET info")
 
+    # ── Filtre shortlist qualitative ──────────────────────────────────────
+    if cfg.use_shortlist and bloc_name in cfg.satellite_shortlist:
+        shortlist = cfg.satellite_shortlist[bloc_name]
+        shortlist_present = [t for t in shortlist if t in prices.columns and t in info.index]
+        shortlist_absent = [t for t in shortlist if t not in prices.columns or t not in info.index]
+        if shortlist_absent:
+            for t in shortlist_absent:
+                logging.warning(
+                    "[%s] Ticker shortlist absent des données : %s – exclu silencieusement.",
+                    bloc_name, t,
+                )
+        prices = prices[[t for t in prices.columns if t in shortlist_present]]
+        common = [t for t in shortlist_present if t in prices.columns]
+        print(f"  [shortlist] {len(common)} fonds retenus sur {len(shortlist)} de la shortlist")
+
     print(f"  [métriques] Calcul sur calib {cfg.calib_start} → {cfg.calib_end}...")
     print(f"  [beta init] Rolling {cfg.beta_filter_window_days}j vs Core équipondéré...")
     beta_init = calculer_beta_rolling(prices, core_eqw_rets, cfg.beta_filter_window_days)
     t_beta = filtrer_niveau_beta_initial(common, beta_init, cfg)
     print(
-        f"  [Niv.Beta] |beta| <= {cfg.beta_filter_max_abs:.0%} sur >= "
-        f"{cfg.beta_filter_min_pass_ratio:.0%} jours   {len(t_beta):3d} / {len(common)}"
+        f"  [Niv.Beta] median|β|<={cfg.beta_filter_max_abs:.0%} "
+        f"q75|β|<={cfg.beta_filter_q75_max:.0%} "
+        f"pass>={cfg.beta_filter_min_pass_ratio:.0%}   {len(t_beta):3d} / {len(common)}"
     )
 
     if not t_beta:
         print(f"  ⚠  Aucun fonds ne passe le filtre beta initial dans {bloc_name}.")
-        return [], pd.DataFrame(), info, pd.DataFrame()
+        return [], pd.DataFrame(), info, pd.DataFrame(), []
 
     prices = prices[t_beta]
     metrics = calculer_metriques_calib(prices, core_rets, cfg.calib_start, cfg.calib_end)
@@ -806,18 +987,35 @@ def traiter_bloc(
         f"{len(t1):3d} / {len(t0)}"
     )
 
-    t2 = filtrer_niveau2(t1, metrics, bloc_cfg)
-    print(f"  [Niv.2] Sharpe/Alpha/Drawdown  {len(t2):3d} / {len(t1)}")
+    t2 = filtrer_niveau2(t1, metrics, bloc_cfg, cfg)
+    print(f"  [Niv.2] Sharpe/Alpha/DD/Corr   {len(t2):3d} / {len(t1)}")
 
     t3 = filtrer_niveau3(t2, info, metrics, bloc_cfg)
     print(f"  [Niv.3] Skew/Kurt/Conc.        {len(t3):3d} / {len(t2)}")
 
     if not t3:
         print(f"  ⚠  Aucun fonds ne passe tous les filtres dans {bloc_name}.")
-        return [], metrics, info, pd.DataFrame()
+        return [], metrics, info, pd.DataFrame(), []
 
     scores = scorer(t3, metrics)
-    selected = selectionner(scores, info, bloc_cfg)
+
+    # Ranked list (respectant la contrainte max_per_strategy) étendue pour les réserves
+    tickers_ranked_extended = selectionner(
+        scores, info,
+        BlocConfig(
+            nom=bloc_cfg.nom,
+            info_path=bloc_cfg.info_path,
+            price_path=bloc_cfg.price_path,
+            n_select=bloc_cfg.n_select + 2,  # n_select + 2 réserves max
+            max_per_strategy=bloc_cfg.max_per_strategy,
+        ),
+    )
+
+    # Filtre cohérence pairwise → sélection finale + réserves
+    prices_calib = prices.loc[cfg.calib_start:cfg.calib_end]
+    selected, reserves = filtrer_coherence_pairwise(
+        tickers_ranked_extended, prices_calib, bloc_cfg.n_select, cfg.corr_pairwise_is_max
+    )
 
     print(f"\n  [sélection] {bloc_name} – {len(selected)} fonds retenus :")
     for rank, ticker in enumerate(selected, 1):
@@ -827,12 +1025,18 @@ def traiter_bloc(
         sh = metrics.at[ticker, "sharpe_calib"] if ticker in metrics.index else np.nan
         print(f"    #{rank}  {ticker:<28s}  strat={strat:<28s}  "
               f"score={sc:+.3f}  β={beta:+.3f}  Sharpe={sh:.3f}")
+    if reserves:
+        print(f"  [réserves] {bloc_name} – {len(reserves)} fonds en réserve :")
+        for rank, ticker in enumerate(reserves, 1):
+            strat = info.at[ticker, "strategie"] if "strategie" in info.columns else "?"
+            sc = scores.get(ticker, np.nan)
+            print(f"    R{rank}  {ticker:<28s}  strat={strat:<28s}  score={sc:+.3f}")
 
     print(f"\n  [beta rolling {cfg.beta_rolling_days}j]...")
     prices_sel = prices[[t for t in selected if t in prices.columns]]
     beta_roll = calculer_beta_rolling(prices_sel, core_rets, cfg.beta_rolling_days)
 
-    return selected, metrics, info, beta_roll
+    return selected, metrics, info, beta_roll, reserves
 
 
 def main(cfg: SatelliteConfig | None = None) -> None:
@@ -843,12 +1047,15 @@ def main(cfg: SatelliteConfig | None = None) -> None:
         cfg.allowed_currencies = [c.strip() for c in env_allowed.split(",") if c.strip()]
 
     print("=" * 60)
-    print("  PIPELINE SATELLITE v2 – Filtrage & Sélection")
+    print("  PIPELINE SATELLITE v3 – Shortlist + Filtres IS renforcés")
     print(f"  Fenêtre calib : {cfg.calib_start} → {cfg.calib_end}")
     if cfg.allowed_currencies:
         print(f"  Filtre devise : {cfg.allowed_currencies}")
     else:
         print("  Filtre devise : désactivé")
+    if cfg.use_shortlist:
+        total_shortlist = sum(len(v) for v in cfg.satellite_shortlist.values())
+        print(f"  Shortlist : {total_shortlist} fonds pré-sélectionnés")
     print("=" * 60)
 
     print("\n[1] Chargement des rendements Core...")
@@ -862,18 +1069,28 @@ def main(cfg: SatelliteConfig | None = None) -> None:
           f"{core_eqw_rets.index.min().date()} → {core_eqw_rets.index.max().date()}")
 
     all_selected: Dict[str, List[str]] = {}
+    all_reserves: Dict[str, List[str]] = {}
     all_info: Dict[str, pd.DataFrame] = {}
     all_metrics: Dict[str, pd.DataFrame] = {}
     all_betas: Dict[str, pd.DataFrame] = {}
+    all_scores: Dict[str, pd.Series] = {}
 
     for bloc_name, bloc_cfg in cfg.blocs.items():
-        sel, metrics, info, beta_roll = traiter_bloc(bloc_name, bloc_cfg, core_rets, core_eqw_rets, cfg)
+        sel, metrics, info, beta_roll, reserves = traiter_bloc(
+            bloc_name, bloc_cfg, core_rets, core_eqw_rets, cfg
+        )
         all_selected[bloc_name] = sel
+        all_reserves[bloc_name] = reserves
         all_info[bloc_name] = info
         all_metrics[bloc_name] = metrics
         all_betas[bloc_name] = beta_roll
+        # Recompute scores for export (only available tickers in metrics)
+        if metrics is not None and not metrics.empty and sel:
+            all_scores[bloc_name] = scorer(sel + reserves, metrics)
+        else:
+            all_scores[bloc_name] = pd.Series(dtype=float)
 
-    # ── Export CSV sélection ─────────────────────────────────────────────
+    # ── Export CSV sélection (compatibilité v2) ──────────────────────────
     print("\n\n[2] Export...")
     rows = []
     for bloc_name, tickers in all_selected.items():
@@ -895,8 +1112,60 @@ def main(cfg: SatelliteConfig | None = None) -> None:
     df_out.to_csv(cfg.output_selected_csv, index=False)
     print(f"    -> {cfg.output_selected_csv}")
 
-    # Export beta rolling par bloc
+    # ── Export satellite_selected_v3.csv ─────────────────────────────────
     out_dir = Path(cfg.output_selected_csv).parent
+    v3_path = str(out_dir / "satellite_selected_v3.csv")
+    v3_rows = []
+    for bloc_name, tickers in all_selected.items():
+        metrics = all_metrics[bloc_name]
+        info = all_info[bloc_name]
+        scores_bloc = all_scores.get(bloc_name, pd.Series(dtype=float))
+        for rank, ticker in enumerate(tickers, 1):
+            row_v3: Dict = {
+                "ticker": ticker,
+                "bloc": bloc_name,
+                "rank": rank,
+                "score": scores_bloc.get(ticker, np.nan),
+            }
+            if ticker in info.index:
+                row_v3["strategie"] = info.at[ticker, "strategie"] if "strategie" in info.columns else np.nan
+            else:
+                row_v3["strategie"] = np.nan
+            if ticker in metrics.index:
+                for col in ["vol_calib", "sharpe_calib", "sortino_calib", "alpha_annual",
+                            "beta_core", "corr_core_calib", "dd_covid", "ret_rel_covid",
+                            "stale_ratio_calib"]:
+                    row_v3[col] = metrics.at[ticker, col] if col in metrics.columns else np.nan
+            v3_rows.append(row_v3)
+    df_v3 = pd.DataFrame(v3_rows)
+    df_v3.to_csv(v3_path, index=False)
+    print(f"    -> {v3_path}")
+
+    # ── Export satellite_reserves.csv ─────────────────────────────────────
+    reserves_path = str(out_dir / "satellite_reserves.csv")
+    reserve_rows = []
+    for bloc_name, reserves in all_reserves.items():
+        metrics = all_metrics[bloc_name]
+        info = all_info[bloc_name]
+        scores_bloc = all_scores.get(bloc_name, pd.Series(dtype=float))
+        for rank_r, ticker in enumerate(reserves, 1):
+            row_r: Dict = {
+                "bloc": bloc_name,
+                "rank_reserve": rank_r,
+                "ticker": ticker,
+                "score": scores_bloc.get(ticker, np.nan),
+            }
+            row_r["strategie"] = (
+                info.at[ticker, "strategie"]
+                if (ticker in info.index and "strategie" in info.columns)
+                else np.nan
+            )
+            reserve_rows.append(row_r)
+    df_reserves = pd.DataFrame(reserve_rows)
+    df_reserves.to_csv(reserves_path, index=False)
+    print(f"    -> {reserves_path}")
+
+    # Export beta rolling par bloc
     for bloc_name, beta_roll in all_betas.items():
         if not beta_roll.empty:
             out = str(out_dir / f"satellite_beta_rolling_{bloc_name}.csv")
@@ -911,6 +1180,11 @@ def main(cfg: SatelliteConfig | None = None) -> None:
         print(f"\n  {bloc_name} ({len(tickers)} fonds) :")
         for t in tickers:
             print(f"    • {t}")
+        reserves = all_reserves.get(bloc_name, [])
+        if reserves:
+            print(f"  Réserves {bloc_name} :")
+            for t in reserves:
+                print(f"    ◦ {t}")
     total = sum(len(v) for v in all_selected.values())
     print(f"\n  Total : {total} fonds satellite")
 
