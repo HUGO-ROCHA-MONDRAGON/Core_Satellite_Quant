@@ -41,6 +41,23 @@ project_root = Path(__file__).resolve().parent.parent
 
 @dataclass
 class FondConfig:
+    """
+    Paramètres de construction et de backtest du fonds Core-Satellite.
+
+    NOTE MÉTHODOLOGIQUE — Séparation IS / OOS :
+      Calibration (IS) : 2019-01-01 → 2020-12-31
+        Tous les calculs quantitatifs (métriques, scores, sélection, allocation satellite)
+        sont effectués EXCLUSIVEMENT sur cette fenêtre. Aucune donnée OOS n'est consultée.
+      Backtest (OOS)   : 2021-01-01 → 2025-12-31
+        Les poids IS sont appliqués tels quels sur cette période de validation.
+
+    NOTE — Chevauchement IS / données Core :
+      Les rendements Core (IS + OOS) partagent la même source de données que la sélection
+      ETF Core (IS 2019-2020). Ce n'est pas un look-ahead bias : la sélection est faite
+      avant le backtest, et les poids rolling ne consultent jamais de données futures.
+      Le warm_up_start = 2018-01-01 dans core_pipeline.py atténue ce chevauchement
+      en permettant une initialisation du lookback avant la période IS.
+    """
     # ── Fenêtres temporelles ──────────────────────────────────────────────────
     calib_start:    str = "2019-01-01"
     calib_end:      str = "2020-12-31"
@@ -217,8 +234,15 @@ def estimer_frais_core_bps(cfg: FondConfig) -> float:
                         t = str(row[ticker_idx]).strip() if pd.notna(row[ticker_idx]) else ""
                         ter = pd.to_numeric(row[ter_idx], errors="coerce")
                         if t and pd.notna(ter) and t not in exp_map:
-                            # TER en décimal (0.002 = 0.2%) → convertir en %
-                            ter_pct = ter * 100.0 if ter < 0.1 else ter
+                            # TER en décimal (ex. 0.002 = 0.2%) → convertir en %.
+                            # Seuil de détection robuste : < 0.05 → format décimal.
+                            # Format "%" : la valeur numérique est le pourcentage
+                            #   (ex. 0.20 pour 0.20%, 5.0 pour 5.0%) → plage [0.01, 5.0].
+                            # Format décimal : la valeur numérique est la fraction
+                            #   (ex. 0.002 pour 0.2%, 0.05 pour 5.0%) → plage [0.0001, 0.05].
+                            # Seuil 0.05 couvre aussi les ETFs très bon marché (< 10 bps
+                            # = valeur décimale 0.001, valeur % 0.10).
+                            ter_pct = ter * 100.0 if ter < 0.05 else ter
                             exp_map[t] = ter_pct
             except Exception:
                 continue
@@ -613,8 +637,9 @@ def backtest(
     tickers  = sat_weights.index.tolist()
     gross_target = w_core + w_sat
 
-    # Rendements simples satellite (forward-fill les NAV manquants)
-    sat_rets_full = sat_prices[tickers].ffill().pct_change()
+    # Rendements simples satellite (forward-fill les NAV manquants, limité à 5 jours
+    # ouvrés consécutifs pour éviter de masquer des interruptions prolongées de cotation)
+    sat_rets_full = sat_prices[tickers].ffill(limit=5).pct_change()
 
     # Fenêtre backtest
     cr = core_rets.loc[cfg.backtest_start:cfg.backtest_end]
@@ -848,6 +873,18 @@ def main() -> None:
     print(f"    Satellite : {sat_prices.shape[1]} fonds | "
           f"{sat_prices.index.min().date()} → {sat_prices.index.max().date()}")
 
+    # ── Audit des dates de track record (informatif) ──────────────────────────
+    print("\n  Track record des fonds satellite sélectionnés :")
+    print(f"  {'Ticker':<32s}  {'Premier prix':>12s}  {'Nb obs calib':>12s}  {'Nb obs OOS':>10s}")
+    for t in tickers_sat:
+        if t in sat_prices.columns:
+            first_date = sat_prices[t].dropna().index.min()
+            sub_calib = sat_prices[t].loc[cfg.calib_start:cfg.calib_end].dropna()
+            sub_oos   = sat_prices[t].loc[cfg.backtest_start:cfg.backtest_end].dropna()
+            print(f"  {t:<32s}  {str(first_date.date()):>12s}  {len(sub_calib):>12d}  {len(sub_oos):>10d}")
+        else:
+            print(f"  {t:<32s}  {'ABSENT':>12s}")
+
     # Disponibilité par fonds dans les deux périodes (calib ET backtest)
     print("    Couverture par période :")
     tickers_with_backtest: List[str] = []
@@ -869,7 +906,9 @@ def main() -> None:
         print(f"\n  → Fonds exclus (données insuffisantes sur calib ou backtest) : {excluded}")
 
     # ── [2] Rendements simples satellite ──────────────────────────────────────
-    sat_rets_full  = sat_prices.ffill().pct_change().sort_index()
+    # ffill limité à 5 jours ouvrés consécutifs pour éviter de masquer des
+    # interruptions prolongées de cotation (biais de survivance implicite).
+    sat_rets_full  = sat_prices.ffill(limit=5).pct_change().sort_index()
     # Restreindre à ceux qui ont des données backtest
     sat_rets_calib = sat_rets_full[tickers_with_backtest].loc[cfg.calib_start:cfg.calib_end].sort_index()
     core_calib     = core_rets.loc[cfg.calib_start:cfg.calib_end].sort_index()
@@ -1033,7 +1072,8 @@ def main() -> None:
     print(f"  -> {cfg.output_returns_csv}")
 
     # Rendements individuels des fonds satellite sur la période OOS
-    sat_rets_oos = sat_prices[sat_weights.index].ffill().pct_change()
+    # ffill limité à 5 jours pour éviter de masquer des interruptions prolongées
+    sat_rets_oos = sat_prices[sat_weights.index].ffill(limit=5).pct_change()
     sat_rets_oos = sat_rets_oos.loc[cfg.backtest_start:cfg.backtest_end]
     sat_rets_oos.to_csv(str(project_root / "outputs" / "satellite_individual_returns.csv"))
     print(f"  -> {project_root / 'outputs' / 'satellite_individual_returns.csv'}")
