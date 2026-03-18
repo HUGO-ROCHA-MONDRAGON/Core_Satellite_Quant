@@ -9,12 +9,14 @@ Sources :
         : benchmark équipondéré dynamique des 3 ETF Core sélectionnés
 
 Structure des 3 blocs :
-  Bloc 1 – Décorrélation / Convexité  : Dérivés, Marché baissier, Spécialisé
-  Bloc 2 – Alpha avec bêta contrôlé   : CTA, Equity Hedge, L/S, Market Neutral…
-  Bloc 3 – Diversification macro      : Commodités, ILS, ARP, Relative Value…
+  Bloc 1 – Décorrélation / Convexité  : CTA Trend, Short Vol
+  Bloc 2 – Alpha Décorrélé            : Event Driven, Merger Arb, L/S, Market Neutral…
+  Bloc 3 – Carry / Crédit Structuré   : ABS, CLO, FI Relative Value, Senior Loans…
 
-Shortlist qualitative : 9 fonds pré-sélectionnés (SATELLITE_SHORTLIST) restreignent
-  l'univers avant tout filtre quantitatif.
+Shortlist qualitative : 19 fonds pré-sélectionnés (SATELLITE_SHORTLIST) restreignent
+  l'univers avant tout filtre quantitatif.  Chaque ticker est recherché dans
+  l'ensemble des 3 fichiers STRAT (info + price) pour éviter toute erreur
+  de mapping fichier ↔ bloc.
 
 Pipeline de filtrage (toutes métriques calculées sur la fenêtre calib 2019-2020) :
     Niveau Beta – Filtre initial renforcé : rolling beta 3 mois vs Core équipondéré,
@@ -66,21 +68,32 @@ SCORE_WEIGHTS: Dict[str, float] = {
 }
 
 # ── Shortlist qualitative des 19 fonds satellite pré-sélectionnés ─────────────
+#    Chaque ticker est recherché dans l'ensemble STRAT1 + STRAT2 + STRAT3.
 SATELLITE_SHORTLIST: Dict[str, List[str]] = {
     "Bloc1": [
-        "DWMAEIA ID Equity",
-        "FINVPRI GR Equity",
+        "DWMAEIA ID Equity",       # CTA Trend (Dunn)           — dans STRAT2
+        "FINVPRI GR Equity",       # Short Vol (FincCam)        — dans STRAT1
     ],
     "Bloc2": [
-        "HFHPERC LX Equity",
-        "EXCREISA LX Equity",
-        "MSEMNA LX Equity",
-        "LIOFVS1 LX Equity",
-        "BRSCSAA LX Equity",
+        "HFHPERC LX Equity",      # Event Driven (Syquant)
+        "EXCRISA LX Equity",      # Merger Arb (Exane)
+        "PDAIEUR LX Equity",      # Multi-Strat MN (Pictet)
+        "HSMSTIC LX Equity",      # Multi-Strat (HSBC)
+        "REYLSEB LX Equity",      # Market Neutral (RAM)
+        "CARPPFE LX Equity",      # L/S EU (Carmignac)
+        "ELEARER LX Equity",      # L/S EU (Eleva)
+        "LDAPB2E ID Equity",      # L/S Asia (Dalton)
+        "LUMNUDE LX Equity",      # Market Neutral (Man GLG)
+        "EXCERFD LX Equity",      # L/S EU value (Exane Ceres)
     ],
     "Bloc3": [
-        "AEABSIA ID Equity",
-        "JPMILVX LX Equity",
+        "AEABSIA ID Equity",      # ABS Senior (Aegon)
+        "BNPAOPP LX Equity",      # ABS Diversifié (BNP)
+        "CLOHQIA GR Equity",      # CLO Senior (Lupus Alpha)
+        "INICLBI GR Equity",      # CLO IG (Infinigon)
+        "DISFCPE LX Equity",      # FI Relative Value (Danske)
+        "LIOFVS1 ID Equity",      # Credit RV (Lion)
+        "MUESEIH ID Equity",      # Senior Loans (Muzinich)
     ],
 }
 
@@ -94,8 +107,6 @@ class BlocConfig:
     """Paramètres de filtrage et de sélection pour un bloc satellite."""
 
     nom: str
-    info_path: str
-    price_path: str
 
     # ── Niveau 1 : Frais ──────────────────────────────────────────────────
     expense_max_default: float = 2.0          # % (frais max par défaut)
@@ -117,6 +128,11 @@ class BlocConfig:
     kurtosis_max: float = 10.0         # kurtosis sur prix calib
     concentration_max: float = 95.0    # % des 10 premières positions (info)
 
+    # ── Filtre beta (override par bloc, -1 = utiliser le global) ─────────
+    beta_max_abs_override: float = -1.0       # si > 0, remplace cfg.beta_filter_max_abs
+    beta_q75_max_override: float = -1.0       # si > 0, remplace cfg.beta_filter_q75_max
+    beta_min_pass_ratio_override: float = -1.0  # si > 0, remplace cfg.beta_filter_min_pass_ratio
+
     # ── Sélection finale ──────────────────────────────────────────────────
     n_select: int = 3
     max_per_strategy: int = 2
@@ -127,6 +143,12 @@ class SatelliteConfig:
     """Configuration globale du pipeline satellite."""
 
     project_root: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
+
+    # ── Fichiers source (info + prix) ─────────────────────────────────────
+    #    Tous les fichiers sont lus et fusionnés ; chaque ticker est trouvé
+    #    quel que soit le fichier dans lequel il se trouve.
+    info_paths: List[str] = field(default_factory=list)
+    price_paths: List[str] = field(default_factory=list)
 
     # ── Source rendements Core (benchmark alpha & beta) ──────────────────
     core_daily_csv: str = ""           # rempli dans __post_init__
@@ -140,10 +162,6 @@ class SatelliteConfig:
     # ── Niveau 0 – Filtres universels ────────────────────────────────────
     aum_min_m: float = 100.0
     max_start_date: str = "2019-01-01"
-    # Filtre devise paramétrable.
-    # Par défaut: EUR uniquement, cohérent avec la contrainte de soutenance.
-    # Override possible via variable d'environnement:
-    #   SAT_ALLOWED_CURRENCIES="Euro,Dollar US"
     allowed_currencies: List[str] = field(default_factory=lambda: ["Euro"])
     excluded_strategies: List[str] = field(default_factory=list)
 
@@ -157,12 +175,13 @@ class SatelliteConfig:
     beta_filter_q75_max: float = 0.55
 
     # ── Qualité de cotation (stale pricing) ─────────────────────────────
-    # Exclut les fonds trop souvent inchangés en business days sur calib.
     stale_max_ratio: float = 0.10
-    # Seuil spécifique par ticker (prioritaire sur le seuil global).
-    # LIOFVS1 LX Equity : valorisation mensuelle → seuil strict à 5%.
     stale_max_ratio_by_ticker: Dict[str, float] = field(
-        default_factory=lambda: {"LIOFVS1 LX Equity": 0.05}
+        default_factory=lambda: {
+            "LIOFVS1 ID Equity": 0.95,   # valorisation mensuelle → stale ratio très élevé, normal
+            "CLOHQIA GR Equity": 0.15,   # CLO : cotation moins fréquente, tolérance élargie
+            "INICLBI GR Equity": 0.10,   # CLO IG
+        }
     )
 
     # ── Filtre corrélation IS ─────────────────────────────────────────────
@@ -193,20 +212,30 @@ class SatelliteConfig:
             self.core3_daily_log_returns_csv = str(r / "outputs" / "core3_etf_daily_log_returns.csv")
         if not self.output_selected_csv:
             self.output_selected_csv = str(r / "outputs" / "satellite_selected.csv")
+        if not self.info_paths:
+            self.info_paths = [
+                str(r / "data" / "STRAT1_info.xlsx"),
+                str(r / "data" / "STRAT2_info.xlsx"),
+                str(r / "data" / "STRAT3_info.xlsx"),
+            ]
+        if not self.price_paths:
+            self.price_paths = [
+                str(r / "data" / "STRAT1_price.xlsx"),
+                str(r / "data" / "STRAT2_price.xlsx"),
+                str(r / "data" / "STRAT3_price.xlsx"),
+            ]
         if not self.blocs:
-            self.blocs = _build_default_blocs(r)
+            self.blocs = _build_default_blocs()
 
 
-def _build_default_blocs(project_root: Path) -> Dict[str, BlocConfig]:
+def _build_default_blocs() -> Dict[str, BlocConfig]:
     """Construit les configurations par défaut des 3 blocs."""
     return {
         "Bloc1": BlocConfig(
             nom="Bloc 1 – Décorrélation / Convexité",
-            info_path=str(project_root / "data" / "STRAT1_info.xlsx"),
-            price_path=str(project_root / "data" / "STRAT1_price.xlsx"),
             expense_max_default=2.0,
             vol_min_default=0.0,
-            vol_max_default=0.20,
+            vol_max_default=0.25,
             vol_min_by_strategy={},
             vol_max_by_strategy={},
             sharpe_min=-0.5,
@@ -215,61 +244,57 @@ def _build_default_blocs(project_root: Path) -> Dict[str, BlocConfig]:
             skew_min=-2.0,
             kurtosis_max=10.0,
             concentration_max=95.0,
+            # CTA et Short Vol peuvent avoir un beta épisodique plus élevé
+            beta_max_abs_override=0.55,
+            beta_q75_max_override=0.75,
+            beta_min_pass_ratio_override=0.60,
             n_select=2,
             max_per_strategy=2,
         ),
         "Bloc2": BlocConfig(
-            nom="Bloc 2 – Alpha avec bêta contrôlé",
-            info_path=str(project_root / "data" / "STRAT2_info.xlsx"),
-            price_path=str(project_root / "data" / "STRAT2_price.xlsx"),
-            expense_max_default=2.0,
-            vol_min_default=0.10,
-            vol_max_default=0.10,
+            nom="Bloc 2 – Alpha Décorrélé",
+            expense_max_default=3.0,
+            vol_min_default=0.0,
+            vol_max_default=0.20,
             vol_min_by_strategy={},
             vol_max_by_strategy={
-                "Neutre au marché":            0.08,
-                "CTA/futures gérés":           0.18,
-                "Long Short":                  0.10,
-                "Equity Hedge":                0.10,
-                "Mené par les événements":     0.10,
-                "Multi-stratégie":             0.10,
+                "Neutre au marché":            0.12,
+                "CTA/futures gérés":           0.20,
+                "Long Short":                  0.15,
+                "Equity Hedge":                0.15,
+                "Mené par les événements":     0.12,
+                "Multi-stratégie":             0.12,
             },
-            sharpe_min=-0.3,
+            sharpe_min=-0.5,
             alpha_min_annual=-0.10,
             drawdown_max=-0.50,
             skew_min=-2.0,
-            kurtosis_max=8.0,
-            concentration_max=80.0,
+            kurtosis_max=10.0,
+            concentration_max=95.0,
             n_select=3,
             max_per_strategy=2,
         ),
         "Bloc3": BlocConfig(
-            nom="Bloc 3 – Diversification macro & scénarios",
-            info_path=str(project_root / "data" / "STRAT3_info.xlsx"),
-            price_path=str(project_root / "data" / "STRAT3_price.xlsx"),
-            expense_max_default=1.5,
+            nom="Bloc 3 – Carry / Crédit Structuré",
+            expense_max_default=1.8,
             expense_max_by_strategy={
-                "Titres adossés à des actifs": 1.8,
-                "Prêts bancaires":             1.8,
+                "Titres adossés à des actifs": 2.0,
+                "Prêts bancaires":             2.0,
             },
-            vol_min_default=0.10,
-            vol_max_default=0.45,
+            vol_min_default=0.0,
+            vol_max_default=0.20,
             vol_min_by_strategy={},
             vol_max_by_strategy={
-                "Energie":                         0.45,
-                "Métaux industriels":              0.30,
-                "Métaux précieux":                 0.30,
-                "Protégé contre l'inflation":      0.20,
-                "Titres adossés à des actifs":     0.08,
-                "Prêts bancaires":                 0.08,
-                "Obligataire Valeur relative":     0.10,
+                "Titres adossés à des actifs":     0.10,
+                "Prêts bancaires":                 0.10,
+                "Obligataire Valeur relative":     0.12,
             },
             sharpe_min=-0.5,
             alpha_min_annual=-0.10,
             drawdown_max=-0.70,
             skew_min=-2.5,
             kurtosis_max=10.0,
-            concentration_max=90.0,
+            concentration_max=95.0,
             n_select=2,
             max_per_strategy=2,
         ),
@@ -285,8 +310,6 @@ def _parse_dates(x: pd.Series) -> pd.Series:
     dt = pd.to_datetime(x, errors="coerce", dayfirst=False)
     if dt.notna().sum() < max(5, int(0.20 * len(x))):
         num = pd.to_numeric(x, errors="coerce")
-        # Filtrer les valeurs hors plage raisonnable pour un serial Excel
-        # (1 = 1900-01-01, ~80 000 ≈ 2119) avant la conversion pour éviter l'overflow
         mask_valid = num.notna() & (num >= 1) & (num <= 80_000)
         dt2 = pd.Series(pd.NaT, index=x.index)
         if mask_valid.any():
@@ -373,9 +396,6 @@ def lire_info(path: str) -> pd.DataFrame:
 
     df = df.rename(columns=rename_map)
 
-    # Nettoyage numérique
-    # Les expense ratios satellite sont déjà en pourcentage dans les Excel
-    # (ex: 0.95 signifie 0.95%), donc aucune mise à l'échelle n'est appliquée.
     for col in ["aum_usd_m", "expense_pct", "concentration"]:
         if col in df.columns:
             df[col] = (
@@ -391,7 +411,6 @@ def lire_info(path: str) -> pd.DataFrame:
     if "date_creation" in df.columns:
         df["date_creation"] = pd.to_datetime(df["date_creation"], errors="coerce", dayfirst=False)
 
-    # Colonne ticker
     if "Ticker" in df.columns:
         df = df.rename(columns={"Ticker": "ticker"})
     if "ticker" not in df.columns:
@@ -400,6 +419,39 @@ def lire_info(path: str) -> pd.DataFrame:
     df = df.dropna(subset=["ticker"])
 
     return df.set_index("ticker")
+
+
+def charger_toutes_les_donnees(cfg: SatelliteConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Charge et fusionne TOUS les fichiers info et price (STRAT1 + STRAT2 + STRAT3).
+    Retourne (all_prices, all_info) couvrant l'ensemble de l'univers.
+    Un ticker présent dans plusieurs fichiers est pris depuis le premier fichier trouvé.
+    """
+    # ── Prix ──────────────────────────────────────────────────────────────
+    all_price_series: Dict[str, pd.Series] = {}
+    for path in cfg.price_paths:
+        print(f"    Lecture prix : {Path(path).name}")
+        wide = lire_prix_wide(path)
+        for col in wide.columns:
+            if col not in all_price_series:
+                all_price_series[col] = wide[col].dropna()
+    all_prices = pd.DataFrame(all_price_series).sort_index()
+    all_prices.index.name = "Date"
+    print(f"    → {len(all_prices.columns)} tickers prix chargés au total")
+
+    # ── Info ──────────────────────────────────────────────────────────────
+    info_frames = []
+    seen_tickers: set = set()
+    for path in cfg.info_paths:
+        print(f"    Lecture info : {Path(path).name}")
+        df = lire_info(path)
+        new_tickers = [t for t in df.index if t not in seen_tickers]
+        info_frames.append(df.loc[new_tickers])
+        seen_tickers.update(new_tickers)
+    all_info = pd.concat(info_frames)
+    print(f"    → {len(all_info)} tickers info chargés au total")
+
+    return all_prices, all_info
 
 
 def charger_core_returns(cfg: SatelliteConfig) -> pd.Series:
@@ -417,8 +469,6 @@ def charger_core_returns(cfg: SatelliteConfig) -> pd.Series:
 def charger_core_eqw_returns_from_csv(cfg: SatelliteConfig) -> pd.Series:
     """
     Construit un benchmark Core équipondéré (3 ETF sélectionnés) depuis des CSV.
-    Les rendements individuels sont lus dans core3_etf_daily_log_returns.csv,
-    convertis en indices de prix, puis agrégés en portefeuille équipondéré.
     """
     selected = pd.read_csv(cfg.core_selected_csv)
     ticker_col = "core_etfs" if "core_etfs" in selected.columns else selected.columns[0]
@@ -435,7 +485,6 @@ def charger_core_eqw_returns_from_csv(cfg: SatelliteConfig) -> pd.Series:
         )
 
     core3_log = core3_log[available[:3]].dropna(how="all")
-    # Reconstruction d'indices de prix (base 100) à partir des log-rendements.
     core3_prices = (100.0 * np.exp(core3_log.cumsum())).ffill()
     core_eqw_price = core3_prices.mean(axis=1).rename("core_eqw_price")
     core_eqw_log = np.log(core_eqw_price).diff().dropna().rename("core_eqw_log_return")
@@ -466,7 +515,7 @@ def _max_drawdown(daily_rets: pd.Series) -> float:
 
 def _ols_alpha_beta(fund_rets: pd.Series, core_rets: pd.Series) -> Tuple[float, float]:
     """OLS : fund = alpha_daily + beta * core + eps → (alpha_annual, beta)."""
-    aligned = pd.concat([fund_rets, core_rets], axis=1).dropna()
+    aligned = pd.concat([fund_rets, core_rets], axis=1, sort=True).dropna()
     if len(aligned) < 30:
         return np.nan, np.nan
     y = aligned.iloc[:, 0].values
@@ -503,22 +552,18 @@ def calculer_metriques_calib(
         if len(s) < 30:
             continue
 
-        # Proxy de stale pricing : part de jours ouvrés sans variation de prix
-        # après forward-fill sur la fenêtre de calibration.
         p = wide_prices[ticker].loc[calib_start:calib_end].reindex(bday_idx).ffill()
         stale_mask = (p.diff().abs() <= 1e-12) & p.notna() & p.shift(1).notna()
         stale_ratio = float(stale_mask.mean()) if len(stale_mask) else np.nan
 
         alpha, beta = _ols_alpha_beta(s, core_calib)
 
-        # Corrélation IS fonds vs core benchmark
-        aligned_corr = pd.concat([s, core_calib], axis=1).dropna()
+        aligned_corr = pd.concat([s, core_calib], axis=1, sort=True).dropna()
         if len(aligned_corr) >= 30:
             corr_core = float(aligned_corr.iloc[:, 0].corr(aligned_corr.iloc[:, 1]))
         else:
             corr_core = np.nan
 
-        # Sortino ratio IS
         ann_ret_s = float((1 + s).prod() ** (252 / len(s)) - 1) if len(s) > 0 else np.nan
         downside = s[s < 0]
         if len(downside) >= 5:
@@ -527,11 +572,10 @@ def calculer_metriques_calib(
         else:
             sortino = np.nan
 
-        # Métriques COVID (fenêtre fixe dans calib → pas de look-ahead)
         s_covid = log_rets[ticker].loc[covid_start:covid_end].dropna()
         if len(s_covid) >= 10:
             dd_covid = _max_drawdown(s_covid)
-            aligned_covid = pd.concat([s_covid, core_covid], axis=1).dropna()
+            aligned_covid = pd.concat([s_covid, core_covid], axis=1, sort=True).dropna()
             if len(aligned_covid) >= 5:
                 ret_fund_covid = float((1 + aligned_covid.iloc[:, 0]).prod() - 1)
                 ret_core_covid = float((1 + aligned_covid.iloc[:, 1]).prod() - 1)
@@ -552,7 +596,7 @@ def calculer_metriques_calib(
             corr_core_calib=corr_core,
             drawdown_calib=_max_drawdown(s),
             skew_calib=float(stats.skew(s)),
-            kurtosis_calib=float(stats.kurtosis(s)),   # excess kurtosis
+            kurtosis_calib=float(stats.kurtosis(s)),
             n_obs_calib=len(s),
             stale_ratio_calib=stale_ratio,
             dd_covid=dd_covid,
@@ -569,12 +613,10 @@ def calculer_beta_rolling(
 ) -> pd.DataFrame:
     """
     Calcule le beta rolling (fenêtre = window jours) de chaque fonds vs Core.
-    Retourne DataFrame : index=Date, cols=tickers.
     """
     fund_rets = np.log(wide_prices).diff().dropna(how="all")
-    aligned = pd.concat([fund_rets, core_rets.rename("__core__")], axis=1).dropna(how="all")
+    aligned = pd.concat([fund_rets, core_rets.rename("__core__")], axis=1, sort=True).dropna(how="all")
 
-    core_col = aligned["__core__"]
     fund_cols = aligned.drop(columns=["__core__"])
 
     betas: Dict[str, pd.Series] = {}
@@ -636,9 +678,9 @@ def filtrer_niveau0(
             if strat in cfg.excluded_strategies:
                 continue
 
-        # Exclure les fonds sans expense ratio renseigné
         expense = row.get("expense_pct", np.nan)
-        if pd.isna(expense):
+        # En mode shortlist, les fonds pré-sélectionnés sans expense renseigné passent
+        if pd.isna(expense) and not cfg.use_shortlist:
             continue
 
         valid.append(ticker)
@@ -656,14 +698,25 @@ def filtrer_niveau_beta_initial(
     tickers: List[str],
     beta_rolling: pd.DataFrame,
     cfg: SatelliteConfig,
+    bloc_cfg: BlocConfig | None = None,
 ) -> List[str]:
     """
     Filtre initial beta renforcé : conserve les fonds dont le beta rolling 3M vs core
-    respecte simultanément les 3 conditions suivantes sur la fenêtre calib IS :
-      1. median(|beta_rolling|) <= beta_filter_max_abs
-      2. quantile_75(|beta_rolling|) <= beta_filter_q75_max
-      3. ratio de jours où |beta_rolling| <= beta_filter_max_abs >= beta_filter_min_pass_ratio
+    respecte simultanément les 3 conditions.
+    Accepte des overrides par bloc (via bloc_cfg) pour les stratégies spéciales.
     """
+    # Utiliser les overrides du bloc si disponibles, sinon les globaux
+    max_abs = cfg.beta_filter_max_abs
+    q75_max = cfg.beta_filter_q75_max
+    min_pass = cfg.beta_filter_min_pass_ratio
+    if bloc_cfg is not None:
+        if bloc_cfg.beta_max_abs_override > 0:
+            max_abs = bloc_cfg.beta_max_abs_override
+        if bloc_cfg.beta_q75_max_override > 0:
+            q75_max = bloc_cfg.beta_q75_max_override
+        if bloc_cfg.beta_min_pass_ratio_override > 0:
+            min_pass = bloc_cfg.beta_min_pass_ratio_override
+
     valid: List[str] = []
     beta_window = beta_rolling.loc[cfg.calib_start:cfg.calib_end]
 
@@ -676,11 +729,11 @@ def filtrer_niveau_beta_initial(
         abs_beta = s.abs()
         median_beta = float(abs_beta.median())
         q75_beta = float(abs_beta.quantile(0.75))
-        pass_ratio = float((abs_beta <= cfg.beta_filter_max_abs).mean())
+        pass_ratio = float((abs_beta <= max_abs).mean())
         if (
-            median_beta <= cfg.beta_filter_max_abs
-            and q75_beta <= cfg.beta_filter_q75_max
-            and pass_ratio >= cfg.beta_filter_min_pass_ratio
+            median_beta <= max_abs
+            and q75_beta <= q75_max
+            and pass_ratio >= min_pass
         ):
             valid.append(ticker)
     return valid
@@ -694,11 +747,7 @@ def filtrer_niveau1(
     cfg: SatelliteConfig,
 ) -> List[str]:
     """
-        Niveau 1 – Frais, Volatilité & Qualité de cotation (calib window) :
-      - Expense ratio ≤ seuil (par stratégie ou défaut bloc)
-            - Volatilité annualisée ≥ seuil minimum (par stratégie ou défaut bloc)
-      - Volatilité annualisée ≤ seuil (par stratégie ou défaut bloc)
-            - Part de jours stale ≤ cfg.stale_max_ratio
+    Niveau 1 – Frais, Volatilité & Qualité de cotation (calib window).
     """
     valid = []
     for ticker in tickers:
@@ -721,7 +770,6 @@ def filtrer_niveau1(
             continue
 
         stale = metrics.at[ticker, "stale_ratio_calib"] if "stale_ratio_calib" in metrics.columns else np.nan
-        # stale_max_ratio_by_ticker prend la priorité sur le seuil global
         stale_threshold = cfg.stale_max_ratio_by_ticker.get(ticker, cfg.stale_max_ratio)
         if not np.isnan(stale) and stale > stale_threshold:
             continue
@@ -737,11 +785,7 @@ def filtrer_niveau2(
     cfg: SatelliteConfig | None = None,
 ) -> List[str]:
     """
-    Niveau 2 – Qualité quantitative (sur calib window) :
-      - Sharpe ≥ sharpe_min
-      - Alpha annualisé vs Core ≥ alpha_min_annual
-      - Max drawdown ≥ drawdown_max  (ex: -0.80)
-      - Corrélation IS vs core ≤ corr_is_max (si cfg fourni)
+    Niveau 2 – Qualité quantitative (sur calib window).
     """
     valid = []
     for ticker in tickers:
@@ -769,10 +813,7 @@ def filtrer_niveau3(
     bloc_cfg: BlocConfig,
 ) -> List[str]:
     """
-    Niveau 3 – Comportemental :
-      - Skewness (calculée sur prix calib) ≥ skew_min
-      - Kurtosis (calculée sur prix calib) ≤ kurtosis_max
-      - Concentration (% des 10 premières positions, from info) ≤ concentration_max
+    Niveau 3 – Comportemental.
     """
     valid = []
     for ticker in tickers:
@@ -812,8 +853,6 @@ def scorer(
 ) -> pd.Series:
     """
     Score composite intra-bloc (z-scoré) basé sur les métriques calib window.
-    Décorrélation-first : neg_abs_beta(30%) + neg_corr_core(10%) + sortino(25%)
-    + ret_rel_covid(15%) + neg_dd_covid(10%) + skew(5%) + neg_kurtosis(5%).
     """
     df = metrics.loc[[t for t in tickers if t in metrics.index]].copy()
     if df.empty:
@@ -868,16 +907,7 @@ def filtrer_coherence_pairwise(
 ) -> Tuple[List[str], List[str]]:
     """
     Filtre de cohérence pairwise (post-scoring, avant sélection finale).
-
-    Prend les tickers dans l'ordre du score décroissant, construit la liste
-    finale de manière greedy :
-      - Ajoute le ticker si sa corrélation IS avec tous les déjà-sélectionnés
-        est <= corr_max.
-      - Sinon skip.
-    Continue jusqu'à n_select fonds ou épuisement de la liste.
-
-    Retourne (selected, reserves) où reserves contient les 2 fonds suivants
-    qui auraient été sélectionnés si n_select était plus grand.
+    Retourne (selected, reserves).
     """
     log_rets = np.log(wide_prices_calib).diff().dropna(how="all")
 
@@ -892,12 +922,11 @@ def filtrer_coherence_pairwise(
         if len(s) < 10:
             continue
 
-        # Vérifie la corrélation pairwise avec les déjà-sélectionnés
         ok = True
         for t_sel in selected:
             if t_sel not in log_rets.columns:
                 continue
-            aligned = pd.concat([s, log_rets[t_sel].dropna()], axis=1).dropna()
+            aligned = pd.concat([s, log_rets[t_sel].dropna()], axis=1, sort=True).dropna()
             if len(aligned) < 10:
                 continue
             corr_val = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
@@ -908,7 +937,6 @@ def filtrer_coherence_pairwise(
         if len(selected) < n_select:
             if ok:
                 selected.append(ticker)
-            # (skipped if corr too high — next ticker takes its place)
         elif len(reserves) < n_reserves:
             if ok:
                 reserves.append(ticker)
@@ -925,24 +953,25 @@ def filtrer_coherence_pairwise(
 def traiter_bloc(
     bloc_name: str,
     bloc_cfg: BlocConfig,
+    all_prices: pd.DataFrame,
+    all_info: pd.DataFrame,
     core_rets: pd.Series,
     core_eqw_rets: pd.Series,
     cfg: SatelliteConfig,
 ) -> Tuple[List[str], pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
     """
-    Traite un bloc complet : lecture → shortlist → calibration → filtrage → score → sélection.
-    Retourne (selected_tickers, metrics_df, info_df, beta_rolling_df, reserves).
+    Traite un bloc complet : shortlist → calibration → filtrage → score → sélection.
+    Les données (all_prices, all_info) couvrent l'ensemble STRAT1+2+3 fusionnés.
     """
     print(f"\n{'=' * 60}")
     print(f"  {bloc_cfg.nom}")
     print(f"{'=' * 60}")
 
-    prices = lire_prix_wide(bloc_cfg.price_path)
-    info = lire_info(bloc_cfg.info_path)
-
-    common = [t for t in prices.columns if t in info.index]
-    prices = prices[common]
-    print(f"  [données] {len(common)} fonds avec prix ET info")
+    # ── Restreindre aux tickers présents dans prix ET info ────────────────
+    common_all = [t for t in all_prices.columns if t in all_info.index]
+    prices = all_prices[common_all]
+    info = all_info.loc[[t for t in common_all if t in all_info.index]]
+    print(f"  [données] {len(common_all)} fonds avec prix ET info (tous fichiers confondus)")
 
     # ── Filtre shortlist qualitative ──────────────────────────────────────
     if cfg.use_shortlist and bloc_name in cfg.satellite_shortlist:
@@ -951,22 +980,32 @@ def traiter_bloc(
         shortlist_absent = [t for t in shortlist if t not in prices.columns or t not in info.index]
         if shortlist_absent:
             for t in shortlist_absent:
+                in_prices = t in all_prices.columns
+                in_info = t in all_info.index
                 logging.warning(
-                    "[%s] Ticker shortlist absent des données : %s – exclu silencieusement.",
-                    bloc_name, t,
+                    "[%s] Ticker shortlist absent : %s (prix=%s, info=%s)",
+                    bloc_name, t, in_prices, in_info,
                 )
+                print(f"  ⚠ Ticker shortlist absent : {t}  (prix={in_prices}, info={in_info})")
         prices = prices[[t for t in prices.columns if t in shortlist_present]]
-        common = [t for t in shortlist_present if t in prices.columns]
+        info = info.loc[[t for t in info.index if t in shortlist_present]]
+        common = shortlist_present
         print(f"  [shortlist] {len(common)} fonds retenus sur {len(shortlist)} de la shortlist")
+    else:
+        common = common_all
 
     print(f"  [métriques] Calcul sur calib {cfg.calib_start} → {cfg.calib_end}...")
     print(f"  [beta init] Rolling {cfg.beta_filter_window_days}j vs Core équipondéré...")
     beta_init = calculer_beta_rolling(prices, core_eqw_rets, cfg.beta_filter_window_days)
-    t_beta = filtrer_niveau_beta_initial(common, beta_init, cfg)
+    t_beta = filtrer_niveau_beta_initial(common, beta_init, cfg, bloc_cfg)
+    # Resolve actual beta thresholds for display
+    _beta_max = bloc_cfg.beta_max_abs_override if bloc_cfg.beta_max_abs_override > 0 else cfg.beta_filter_max_abs
+    _beta_q75 = bloc_cfg.beta_q75_max_override if bloc_cfg.beta_q75_max_override > 0 else cfg.beta_filter_q75_max
+    _beta_pass = bloc_cfg.beta_min_pass_ratio_override if bloc_cfg.beta_min_pass_ratio_override > 0 else cfg.beta_filter_min_pass_ratio
     print(
-        f"  [Niv.Beta] median|β|<={cfg.beta_filter_max_abs:.0%} "
-        f"q75|β|<={cfg.beta_filter_q75_max:.0%} "
-        f"pass>={cfg.beta_filter_min_pass_ratio:.0%}   {len(t_beta):3d} / {len(common)}"
+        f"  [Niv.Beta] median|β|<={_beta_max:.0%} "
+        f"q75|β|<={_beta_q75:.0%} "
+        f"pass>={_beta_pass:.0%}   {len(t_beta):3d} / {len(common)}"
     )
 
     if not t_beta:
@@ -1004,8 +1043,6 @@ def traiter_bloc(
         scores, info,
         BlocConfig(
             nom=bloc_cfg.nom,
-            info_path=bloc_cfg.info_path,
-            price_path=bloc_cfg.price_path,
             n_select=bloc_cfg.n_select + 2,  # n_select + 2 réserves max
             max_per_strategy=bloc_cfg.max_per_strategy,
         ),
@@ -1019,7 +1056,7 @@ def traiter_bloc(
 
     print(f"\n  [sélection] {bloc_name} – {len(selected)} fonds retenus :")
     for rank, ticker in enumerate(selected, 1):
-        strat = info.at[ticker, "strategie"] if "strategie" in info.columns else "?"
+        strat = info.at[ticker, "strategie"] if (ticker in info.index and "strategie" in info.columns) else "?"
         sc = scores.get(ticker, np.nan)
         beta = metrics.at[ticker, "beta_core"] if ticker in metrics.index else np.nan
         sh = metrics.at[ticker, "sharpe_calib"] if ticker in metrics.index else np.nan
@@ -1028,7 +1065,7 @@ def traiter_bloc(
     if reserves:
         print(f"  [réserves] {bloc_name} – {len(reserves)} fonds en réserve :")
         for rank, ticker in enumerate(reserves, 1):
-            strat = info.at[ticker, "strategie"] if "strategie" in info.columns else "?"
+            strat = info.at[ticker, "strategie"] if (ticker in info.index and "strategie" in info.columns) else "?"
             sc = scores.get(ticker, np.nan)
             print(f"    R{rank}  {ticker:<28s}  strat={strat:<28s}  score={sc:+.3f}")
 
@@ -1058,6 +1095,10 @@ def main(cfg: SatelliteConfig | None = None) -> None:
         print(f"  Shortlist : {total_shortlist} fonds pré-sélectionnés")
     print("=" * 60)
 
+    # ── Chargement centralisé de TOUTES les données ──────────────────────
+    print("\n[0] Chargement des données (STRAT1 + STRAT2 + STRAT3)...")
+    all_prices, all_info = charger_toutes_les_donnees(cfg)
+
     print("\n[1] Chargement des rendements Core...")
     core_rets = charger_core_returns(cfg)
     print(f"    {len(core_rets)} obs. daily | "
@@ -1070,21 +1111,21 @@ def main(cfg: SatelliteConfig | None = None) -> None:
 
     all_selected: Dict[str, List[str]] = {}
     all_reserves: Dict[str, List[str]] = {}
-    all_info: Dict[str, pd.DataFrame] = {}
+    all_info_bloc: Dict[str, pd.DataFrame] = {}
     all_metrics: Dict[str, pd.DataFrame] = {}
     all_betas: Dict[str, pd.DataFrame] = {}
     all_scores: Dict[str, pd.Series] = {}
 
     for bloc_name, bloc_cfg in cfg.blocs.items():
         sel, metrics, info, beta_roll, reserves = traiter_bloc(
-            bloc_name, bloc_cfg, core_rets, core_eqw_rets, cfg
+            bloc_name, bloc_cfg, all_prices, all_info,
+            core_rets, core_eqw_rets, cfg
         )
         all_selected[bloc_name] = sel
         all_reserves[bloc_name] = reserves
-        all_info[bloc_name] = info
+        all_info_bloc[bloc_name] = info
         all_metrics[bloc_name] = metrics
         all_betas[bloc_name] = beta_roll
-        # Recompute scores for export (only available tickers in metrics)
         if metrics is not None and not metrics.empty and sel:
             all_scores[bloc_name] = scorer(sel + reserves, metrics)
         else:
@@ -1095,7 +1136,7 @@ def main(cfg: SatelliteConfig | None = None) -> None:
     rows = []
     for bloc_name, tickers in all_selected.items():
         metrics = all_metrics[bloc_name]
-        info = all_info[bloc_name]
+        info = all_info_bloc[bloc_name]
         for ticker in tickers:
             row: Dict = {"bloc": bloc_name, "ticker": ticker}
             if ticker in info.index:
@@ -1118,7 +1159,7 @@ def main(cfg: SatelliteConfig | None = None) -> None:
     v3_rows = []
     for bloc_name, tickers in all_selected.items():
         metrics = all_metrics[bloc_name]
-        info = all_info[bloc_name]
+        info = all_info_bloc[bloc_name]
         scores_bloc = all_scores.get(bloc_name, pd.Series(dtype=float))
         for rank, ticker in enumerate(tickers, 1):
             row_v3: Dict = {
@@ -1146,7 +1187,7 @@ def main(cfg: SatelliteConfig | None = None) -> None:
     reserve_rows = []
     for bloc_name, reserves in all_reserves.items():
         metrics = all_metrics[bloc_name]
-        info = all_info[bloc_name]
+        info = all_info_bloc[bloc_name]
         scores_bloc = all_scores.get(bloc_name, pd.Series(dtype=float))
         for rank_r, ticker in enumerate(reserves, 1):
             row_r: Dict = {

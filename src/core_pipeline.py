@@ -1,22 +1,22 @@
 """
-Pipeline Core – v4 (Excel unifié)
+Pipeline Core – v5 (Excel unifié wide format)
 
 Sources de données :
-  - 'ETF EUR Bloomberg Cross Asset.xlsx'
-      * EQUITY : prix daily (paires date/prix)
-      * RATES  : prix daily (paires date/prix)
-      * CREDIT : prix daily (paires date/prix)
-      * Worksheet (optionnel) : metadata TER
+  - 'univers_core_etf_eur_daily_wide_VF.xlsx'
+      * Equity / Credit / Rates            : metadata (TER, devise, nom, exposition…)
+      * Equity_Wide_Daily_Values            : prix daily wide (dates en lignes, tickers en colonnes)
+      * Credit_Wide_Daily_Values            : idem
+      * Rates_Wide_Daily_Values             : idem
 
 Pipeline :
-  1) Lecture prix Equity/Rates/Credit depuis le même fichier
-  2) Filtrage structurel (date de démarrage, fréquence ; frais si metadata dispo)
-  3) Sélection 1 ETF « best » par thème :
-       - Equity  : pick_best parmi EQUITY
-       - Rates   : pick_best parmi RATES
-       - Credit  : pick_best parmi CREDIT
-  4) Backtest rolling OOS trimestriel (Max Sharpe, poids ∈ [5%, 50%])
-  5) Export rendements journaliers du Core (3 ETFs sélectionnés)
+  1) Lecture prix Equity/Rates/Credit (format wide natif)
+  2) Lecture metadata TER depuis les onglets descriptifs
+  3) Filtrage structurel (date de démarrage, fréquence, expense ratio)
+  4) Sélection 1 ETF « best » par thème (Equity, Rates, Credit)
+  5) Backtest rolling OOS trimestriel (Max Sharpe, poids ∈ [5%, 50%])
+  6) Export rendements journaliers du Core (3 ETFs sélectionnés)
+
+Tous les ETF du fichier sont cotés en EUR (pas de hedged EUR).
 """
 
 from __future__ import annotations
@@ -36,24 +36,33 @@ class CoreConfig:
     project_root: Path = Path(__file__).resolve().parent.parent
 
     # ── Fichier Excel unifié ───────────────────────
-    core_excel: str = str(project_root / "data" / "ETF EUR Bloomberg Cross Asset.xlsx")
-    sheet_equity: str = "EQUITY"
-    sheet_rates: str = "RATES"
-    sheet_credit: str = "CREDIT"
-    # Metadata TER optionnel
-    sheet_meta: str = "Worksheet"
-    require_expense_info: bool = False
+    core_excel: str = str(project_root / "univers_core_etf_eur_daily_wide_VF.xlsx")
 
-    # ── Filtres Equity ────────────────────────────
+    # Onglets prix (format wide : dates en lignes, tickers en colonnes)
+    sheet_equity_prices: str = "Equity_Wide_Daily_Values"
+    sheet_credit_prices: str = "Credit_Wide_Daily_Values"
+    sheet_rates_prices: str = "Rates_Wide_Daily_Values"
+
+    # Onglets metadata
+    sheet_equity_meta: str = "Equity"
+    sheet_credit_meta: str = "Credit"
+    sheet_rates_meta: str = "Rates"
+
+    # ── Filtres ─────────────────────────────────────
     max_start_date: str = "2019-01-01"
     max_avg_gap_days: float = 2.0
     total_fee_budget_bps: float = 80.0
     w_core_mid: float = 0.725
     satellite_expense_bps: float = 60.0
+    require_expense_info: bool = False
 
-    # ── pick_best ─────────────────────────────────
-    min_obs_pick_best: int = 750
-    # Fenêtre de calibration pour le scoring (évite le look-ahead)
+    # ── Filtre exposition Equity ─────────────────────
+    #    Ne retenir que les ETFs dont l'exposition contient un de ces mots-clés.
+    #    Vide = pas de filtre (tout passe).
+    equity_exposure_keywords: tuple = ("Europe",)
+
+    # ── pick_best (IS = In-Sample) ──────────────────
+    min_obs_pick_best: int = 250
     score_start: str = "2019-01-01"
     score_end: str = "2020-12-31"
 
@@ -63,9 +72,13 @@ class CoreConfig:
     w_min: float = 0.05
     w_max: float = 0.50
 
-    # ── Sorties ───────────────────────────────────
+    # ── Fenêtres IS / OOS ────────────────────────
+    oos_start: str = "2021-01-01"
+    oos_end: str = "2025-12-31"
 
+    # ── Sorties ───────────────────────────────────
     output_core_daily_csv: str = str(project_root / "outputs" / "core_returns_daily_oos.csv")
+    output_core_daily_is_csv: str = str(project_root / "outputs" / "core_returns_daily_is.csv")
     output_selected_core_csv: str = str(project_root / "outputs" / "core_selected_etfs.csv")
     output_core_finaux_csv: str = str(project_root / "outputs" / "Core_finaux.csv")
 
@@ -76,108 +89,151 @@ class CoreConfig:
         max_bps = (self.total_fee_budget_bps - w_sat * self.satellite_expense_bps) / self.w_core_mid
         return max_bps / 100.0
 
-def _parse_dates_any(x: pd.Series) -> pd.Series:
-    """Parse dates robuste : datetime / string dayfirst / serial Excel."""
-    dt = pd.to_datetime(x, errors="coerce", dayfirst=True)
-    if dt.notna().sum() < max(5, int(0.20 * len(x))):
-        num = pd.to_numeric(x, errors="coerce")
-        mask_valid = num.notna() & (num >= 1) & (num <= 80_000)
-        dt2 = pd.Series(pd.NaT, index=x.index)
-        if mask_valid.any():
-            dt2.loc[mask_valid] = pd.to_datetime(
-                num.loc[mask_valid].astype(int),
-                errors="coerce", unit="D", origin="1899-12-30"
-            )
-        dt = dt.fillna(dt2)
-    # Évite les dates aberrantes (ex: 1970) dues aux cellules mal parsées.
-    year = dt.dt.year
-    dt = dt.where(year.between(1990, 2100))
-    return dt
-
 
 # ══════════════════════════════════════════════════
-#  Lecture des données
+#  Lecture des données (nouveau format wide)
 # ══════════════════════════════════════════════════
 
-def _lire_wide_paires(path: str, sheet, skiprows: int = 0) -> Tuple[pd.DataFrame, List[str]]:
+def _lire_wide_values(path: str, sheet: str) -> pd.DataFrame:
     """
-    Lecture générique d'un Excel avec paires (date, prix).
-    Retourne (wide DataFrame, liste ordonnée des tickers).
+    Lit un onglet *_Wide_Daily_Values :
+      - Ligne 6 (0-indexed) = tickers Bloomberg (col 0 = "Bloomberg security")
+      - Ligne 10+ = données (col 0 = dates, cols 1+ = prix)
+    Retourne DataFrame wide : index=DatetimeIndex, columns=Bloomberg tickers.
     """
-    df = pd.read_excel(path, sheet_name=sheet, header=None, skiprows=skiprows)
-    tickers_row = df.iloc[0, :].tolist()
-    data = df.iloc[1:]
+    df = pd.read_excel(path, sheet_name=sheet, header=None)
 
-    seen: set = set()
-    series_dict: Dict[str, pd.Series] = {}
-    ordered_tickers: List[str] = []
+    # Tickers depuis la ligne 6
+    tickers_row = df.iloc[6].tolist()
+    tickers = []
+    for i, v in enumerate(tickers_row):
+        if i == 0:
+            continue  # col 0 = "Bloomberg security"
+        if isinstance(v, str) and v.strip():
+            tickers.append(v.strip())
+        else:
+            tickers.append(f"__col{i}__")
 
-    for j in range(0, df.shape[1], 2):
-        ticker = tickers_row[j] if j < len(tickers_row) else None
-        if not isinstance(ticker, str):
-            continue
-        ticker = ticker.strip()
-        if ticker in seen:
-            continue
-        seen.add(ticker)
+    # Données depuis la ligne 10
+    data = df.iloc[10:].copy()
+    data.columns = ["Date"] + tickers[:data.shape[1] - 1]
 
-        price_col = j + 1
-        if price_col >= df.shape[1]:
-            break
+    # Parse dates
+    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+    data = data.dropna(subset=["Date"])
+    data = data.set_index("Date").sort_index()
 
-        dates = _parse_dates_any(data.iloc[:, j])
-        prices = pd.to_numeric(data.iloc[:, price_col], errors="coerce")
-        valid = dates.notna() & prices.notna()
-        if valid.sum() == 0:
-            continue
+    # Convertir en numérique
+    for col in data.columns:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
 
-        s = pd.Series(prices[valid].values,
-                      index=pd.DatetimeIndex(dates[valid].values),
-                      name=ticker)
-        s = s.sort_index()
-        s = s[~s.index.duplicated(keep="first")]
-        series_dict[ticker] = s
-        ordered_tickers.append(ticker)
+    # Supprimer colonnes placeholder
+    data = data[[c for c in data.columns if not c.startswith("__col")]]
+    data.index.name = "Date"
 
-    wide = pd.DataFrame(series_dict).sort_index()
-    wide.index.name = "Date"
-    return wide, ordered_tickers
+    return data
 
 
-def lire_equity(cfg: CoreConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _lire_metadata(path: str, sheet: str) -> pd.DataFrame:
     """
-    Lit les ETFs Equity depuis le nouveau fichier + metadata,
-    applique les filtres (date, fréquence, expense ratio).
-    Retourne (wide_filtré, summary).
+    Lit un onglet metadata (Equity/Credit/Rates) :
+      - Ligne 4 (0-indexed) = header
+      - Ligne 5+ = données
+    Retourne DataFrame avec Bloomberg ticker en index.
     """
-    print("[1/7] Lecture Equity (fichier unifié)...")
-    wide, _ = _lire_wide_paires(cfg.core_excel, cfg.sheet_equity)
-    print(f"  -> {wide.shape[1]} ETFs uniques | {wide.index.min().date()} à {wide.index.max().date()}")
+    df = pd.read_excel(path, sheet_name=sheet, header=None)
 
-    # Metadata TER (optionnel)
+    # Header en ligne 4
+    headers = df.iloc[4].tolist()
+    # Normaliser
+    col_map = {}
+    for i, h in enumerate(headers):
+        hs = str(h).strip().lower() if pd.notna(h) else f"col_{i}"
+        if "bloomberg" in hs:
+            col_map[i] = "ticker"
+        elif "ter" in hs:
+            col_map[i] = "ter_pct"
+        elif "devise" in hs:
+            col_map[i] = "devise"
+        elif "nom" in hs:
+            col_map[i] = "nom"
+        elif "exposition" in hs or "indice" in hs:
+            col_map[i] = "exposition"
+        elif "provider" in hs:
+            col_map[i] = "provider"
+        elif "isin" in hs:
+            col_map[i] = "isin"
+        elif "encours" in hs:
+            col_map[i] = "encours_eur_m"
+        else:
+            col_map[i] = hs
+
+    data = df.iloc[5:].copy()
+    data.columns = range(len(data.columns))
+    data = data.rename(columns=col_map)
+
+    if "ticker" in data.columns:
+        data["ticker"] = data["ticker"].astype(str).str.strip()
+        data = data.dropna(subset=["ticker"])
+        data = data[data["ticker"] != "nan"]
+        data = data.set_index("ticker")
+
+    if "ter_pct" in data.columns:
+        data["ter_pct"] = pd.to_numeric(data["ter_pct"], errors="coerce")
+        # Si TER en décimal (0.002 = 0.2%), convertir en %
+        if data["ter_pct"].dropna().max() < 0.1:
+            data["ter_pct"] = data["ter_pct"] * 100.0
+
+    if "encours_eur_m" in data.columns:
+        data["encours_eur_m"] = pd.to_numeric(data["encours_eur_m"], errors="coerce")
+
+    return data
+
+
+def lire_theme(
+    cfg: CoreConfig,
+    theme_name: str,
+    sheet_prices: str,
+    sheet_meta: str,
+    exposure_keywords: tuple = (),
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Lit prix + metadata d'un thème, applique filtres structurels.
+    Si exposure_keywords est non-vide, ne retient que les ETFs dont le champ
+    'exposition' dans la metadata contient au moins un des mots-clés.
+    Retourne (wide_filtré, summary, metadata).
+    """
+    print(f"  Lecture {theme_name}...")
+    wide = _lire_wide_values(cfg.core_excel, sheet_prices)
+    meta = _lire_metadata(cfg.core_excel, sheet_meta)
+    print(f"    -> {wide.shape[1]} ETFs | {wide.index.min().date()} à {wide.index.max().date()}")
+
+    # ── Filtre exposition (si demandé) ────────────────────────────────────
+    if exposure_keywords and "exposition" in meta.columns:
+        allowed = []
+        for t in wide.columns:
+            if t in meta.index:
+                expo = str(meta.at[t, "exposition"]).lower()
+                if any(kw.lower() in expo for kw in exposure_keywords):
+                    allowed.append(t)
+            # Si pas de metadata et filtre actif → exclure (on ne peut pas vérifier)
+        n_excl_expo = wide.shape[1] - len(allowed)
+        if n_excl_expo > 0:
+            print(f"    Filtre exposition ({', '.join(exposure_keywords)}) : "
+                  f"{len(allowed)} retenus, {n_excl_expo} exclus")
+        wide = wide[allowed]
+
+    # Expense map depuis metadata
     expense_map: Dict[str, float] = {}
-    try:
-        xls = pd.ExcelFile(cfg.core_excel)
-        if cfg.sheet_meta in xls.sheet_names:
-            df_meta = pd.read_excel(xls, sheet_name=cfg.sheet_meta)
-            if {"Ticker", "Expense Ratio"}.issubset(set(df_meta.columns)):
-                df_meta["expense_ratio_pct"] = (
-                    df_meta["Expense Ratio"]
-                    .astype(str)
-                    .str.replace("%", "", regex=False)
-                    .str.replace(",", ".", regex=False)
-                    .pipe(pd.to_numeric, errors="coerce")
-                )
-                df_meta["ticker_full"] = df_meta["Ticker"].astype(str).str.strip() + " Equity"
-                expense_map = dict(zip(df_meta["ticker_full"], df_meta["expense_ratio_pct"]))
-    except Exception as exc:
-        print(f"  ⚠  Metadata TER indisponible ({exc}). Filtre frais assoupli.")
+    if "ter_pct" in meta.columns:
+        for t in meta.index:
+            val = meta.at[t, "ter_pct"]
+            if pd.notna(val):
+                expense_map[t] = float(val)
 
-    # Filtrage
+    # Filtrage structurel
     max_date = pd.Timestamp(cfg.max_start_date)
     max_expense = cfg.max_core_expense_pct
-    print(f"[2/7] Filtrage Equity : début ≤ {cfg.max_start_date} | daily (gap ≤ {cfg.max_avg_gap_days}) "
-          f"| expense ≤ {max_expense:.2f} %")
 
     kept: List[str] = []
     rows: List[dict] = []
@@ -209,131 +265,44 @@ def lire_equity(cfg: CoreConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
             kept.append(ticker)
 
     summary = pd.DataFrame(rows)
-    print(f"  -> {len(wide.columns)} total | "
-          f"excl. date {(~summary['pass_date']).sum()} | "
-          f"excl. fréq {(~summary['pass_freq']).sum()} | "
-          f"excl. frais {(~summary['pass_expense']).sum()}")
-    print(f"  -> ✓ {len(kept)} ETFs Equity retenus")
+    n_excl_date = (~summary["pass_date"]).sum() if len(summary) else 0
+    n_excl_freq = (~summary["pass_freq"]).sum() if len(summary) else 0
+    n_excl_exp = (~summary["pass_expense"]).sum() if len(summary) else 0
+    print(f"    Filtrés : {len(kept)} retenus "
+          f"(excl. date {n_excl_date}, freq {n_excl_freq}, frais {n_excl_exp})")
 
     wide_filtered = wide[kept].dropna(how="all").ffill()
-    return wide_filtered, summary
-
-
-def lire_rates_credit(cfg: CoreConfig) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """
-    Lit les ETFs Rates & Credit depuis le fichier Excel unifié,
-    reconstruit le mapping ticker → bucket.
-    """
-    print("[3/7] Lecture Rates / Credit (fichier unifié)...")
-    wide_rates, _ = _lire_wide_paires(cfg.core_excel, cfg.sheet_rates)
-    wide_credit, _ = _lire_wide_paires(cfg.core_excel, cfg.sheet_credit)
-
-    # Filtrage structurel commun (date/frequence)
-    max_date = pd.Timestamp(cfg.max_start_date)
-    kept_rates: List[str] = []
-    for t in wide_rates.columns:
-        s = wide_rates[t].dropna()
-        if len(s) < 10:
-            continue
-        avg_gap = s.index.to_series().diff().dropna().dt.days.mean()
-        if s.index.min() <= max_date and avg_gap <= cfg.max_avg_gap_days:
-            kept_rates.append(t)
-
-    kept_credit: List[str] = []
-    for t in wide_credit.columns:
-        s = wide_credit[t].dropna()
-        if len(s) < 10:
-            continue
-        avg_gap = s.index.to_series().diff().dropna().dt.days.mean()
-        if s.index.min() <= max_date and avg_gap <= cfg.max_avg_gap_days:
-            kept_credit.append(t)
-
-    wide = pd.concat([wide_rates[kept_rates], wide_credit[kept_credit]], axis=1)
-    wide = wide.loc[:, ~wide.columns.duplicated(keep="first")]
-    wide = wide.sort_index().ffill()
-    wide.index.name = "Date"
-
-    # Mapping thème pour la sélection pick_best
-    ticker_to_bucket: Dict[str, str] = {}
-    for t in kept_rates:
-        ticker_to_bucket[t] = "Rates EMU Govies (Core)"
-    for t in kept_credit:
-        ticker_to_bucket[t] = "Credit EMU IG (Core)"
-
-    print(f"  -> {wide.shape[1]} ETFs Rates/Credit | {wide.index.min().date()} à {wide.index.max().date()}")
-    for t in wide.columns:
-        print(f"     {t:25s}  bucket = {ticker_to_bucket.get(t, '?')}")
-
-    return wide, ticker_to_bucket
+    return wide_filtered, summary, meta
 
 
 # ══════════════════════════════════════════════════
-#  Thèmes & pick_best
+#  pick_best & optimisation
 # ══════════════════════════════════════════════════
 
-def definir_themes() -> Dict[str, Set[str]]:
-    return {
-        "Rates": {"Rates EMU Govies (Core)", "Rates EMU Govies (Bucket)", "Rates EMU Govies (Linkers)"},
-        "Credit": {
-            "Credit EMU IG (Core)", "Credit EMU IG (Bucket)",
-            "Credit EMU IG (Large Cap)", "Credit EMU IG (Covered)",
-            "EMU Aggregate (IG)",
-        },
-    }
-
-
-def pick_best(
+def pick_best_theme(
     theme_name: str,
     wide: pd.DataFrame,
-    rets_log: pd.DataFrame,
-    ticker_to_bucket: Dict[str, str],
-    themes: Dict[str, Set[str]],
+    rets_log_calib: pd.DataFrame,
     min_obs: int,
 ) -> str:
     """
-    Sélection du meilleur ETF par thème.
-    rets_log doit être pré-restreint à la fenêtre de calibration (pas de look-ahead).
-    score = corrélation moyenne intra-thème + bonus obs − pénalité vol.
-    min_obs est appliqué sur la fenêtre de calibration passée.
+    Sélection du meilleur ETF pour un thème donné.
+    Score = corrélation moyenne intra-thème + bonus obs − pénalité vol.
     """
-    cands = [t for t in wide.columns if ticker_to_bucket.get(t, "") in themes[theme_name]]
-    # Filtre : ETF présent dans la fenêtre de calibration avec assez d'obs
-    cands = [t for t in cands if t in rets_log.columns and rets_log[t].dropna().shape[0] >= min(min_obs, len(rets_log) // 2)]
+    cands = [t for t in wide.columns
+             if t in rets_log_calib.columns
+             and rets_log_calib[t].dropna().shape[0] >= min(min_obs, len(rets_log_calib) // 2)]
 
     if len(cands) == 0:
         raise ValueError(f"Aucun candidat pour {theme_name} dans la fenêtre de calibration")
 
-    R = rets_log[cands].dropna(how="all")
+    if len(cands) == 1:
+        return cands[0]
+
+    R = rets_log_calib[cands].dropna(how="all")
     corr = R.corr()
     avg_corr = corr.mean(axis=1).values
-    obs = np.array([rets_log[t].dropna().shape[0] for t in cands], dtype=float)
-    vol = R.std().values
-
-    obs_z = (obs - obs.mean()) / (obs.std() + 1e-12)
-    vol_z = (vol - vol.mean()) / (vol.std() + 1e-12)
-
-    score = avg_corr + 0.10 * obs_z - 0.10 * vol_z
-    return cands[int(np.argmax(score))]
-
-
-def pick_best_equity(
-    wide_equity: pd.DataFrame,
-    rets_log: pd.DataFrame,
-    min_obs: int,
-) -> str:
-    """
-    Sélection du meilleur ETF Equity parmi les candidats filtrés.
-    rets_log doit être pré-restreint à la fenêtre de calibration (pas de look-ahead).
-    """
-    cands = [t for t in wide_equity.columns
-             if t in rets_log.columns and rets_log[t].dropna().shape[0] >= min(min_obs, len(rets_log) // 2)]
-    if len(cands) == 0:
-        raise ValueError(f"Aucun candidat Equity dans la fenêtre de calibration")
-
-    R = rets_log[cands].dropna(how="all")
-    corr = R.corr()
-    avg_corr = corr.mean(axis=1).values
-    obs = np.array([rets_log[t].dropna().shape[0] for t in cands], dtype=float)
+    obs = np.array([rets_log_calib[t].dropna().shape[0] for t in cands], dtype=float)
     vol = R.std().values
 
     obs_z = (obs - obs.mean()) / (obs.std() + 1e-12)
@@ -344,10 +313,7 @@ def pick_best_equity(
 
 
 def optimiser_max_sharpe_contraint(mu: np.ndarray, cov: np.ndarray, w_min: float, w_max: float) -> np.ndarray:
-    """
-    Optimisation Max Sharpe (rf=0) sous contraintes long-only et bornes [w_min, w_max].
-    Fallback : équipondéré si échec.
-    """
+    """Max Sharpe (rf=0) sous contraintes long-only et bornes [w_min, w_max]."""
     n = len(mu)
     x0 = np.ones(n) / n
 
@@ -355,36 +321,29 @@ def optimiser_max_sharpe_contraint(mu: np.ndarray, cov: np.ndarray, w_min: float
         vol = float(np.sqrt(w @ cov @ w))
         if vol < 1e-12:
             return 1e10
-        ret = float(w @ mu)
-        return -(ret / vol)
+        return -(float(w @ mu) / vol)
 
     bounds = [(w_min, w_max)] * n
     cons = {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
-
     res = minimize(neg_sharpe, x0, method="SLSQP", bounds=bounds, constraints=cons)
-    if not res.success:
-        return x0
-    return res.x
+    return res.x if res.success else x0
 
 
-def backtest_rolling_oos(
+def backtest_rolling(
     prices: pd.DataFrame,
     lookback: int,
     rebal_freq: int,
     w_min: float,
     w_max: float,
+    oos_start: str | None = None,
+    oos_end: str | None = None,
+    label: str = "OOS",
 ) -> pd.Series:
     """
-    Backtest rolling trimestriel OOS :
-    - On estime mu/cov sur une fenêtre lookback (log-rendements)
-    - On optimise max sharpe sous contraintes
-    - On applique les poids sur la période suivante (OOS) en log-rendements
-
-    Sortie :
-    - série de log-rendements OOS quotidiens du portefeuille Core
+    Backtest rolling trimestriel (Max Sharpe contraint).
+    Si oos_start/oos_end sont fournis, ne retient que les rendements dans cette fenêtre.
+    La calibration (lookback) utilise toujours les données précédant chaque rebalancement.
     """
-    print("[6/7] Backtest rolling OOS (Max Sharpe contraint)...")
-
     rets_log = np.log(prices).diff().dropna()
     dates = rets_log.index
 
@@ -404,92 +363,162 @@ def backtest_rolling_oos(
         port_log_rets.extend(oos_port.tolist())
         port_dates.extend(oos.index.tolist())
 
-    s = pd.Series(port_log_rets, index=pd.DatetimeIndex(port_dates), name="core_log_return_oos")
+    s = pd.Series(port_log_rets, index=pd.DatetimeIndex(port_dates), name=f"core_log_return_{label.lower()}")
     s = s.sort_index()
-    print(f"  -> OOS: {s.index.min().date()} à {s.index.max().date()} | Nb jours: {len(s)}")
+
+    # Filtrer sur la fenêtre demandée
+    if oos_start:
+        s = s.loc[oos_start:]
+    if oos_end:
+        s = s.loc[:oos_end]
+
     return s
 
 
-def log_daily_to_monthly_simple(log_daily: pd.Series) -> pd.Series:
-    """
-    Convertit des log-rendements journaliers en rendements simples mensuels :
-    r_m = exp( somme(log_r_jour) ) - 1
-    """
-    print("[7/7] Conversion OOS journalier -> mensuel (r_m = exp(sum) - 1)...")
-    monthly = np.exp(log_daily.resample("ME").sum()) - 1.0
-    monthly = monthly.dropna()
-    monthly.name = "core_portfolio_return"
-    print(f"  -> Nb mois: {len(monthly)} | Début: {monthly.index.min().date()} | Fin: {monthly.index.max().date()}")
-    return monthly
+def _print_perf_summary(log_rets: pd.Series, label: str) -> None:
+    """Affiche un résumé de performance."""
+    if len(log_rets) == 0:
+        print(f"  {label}: aucune donnée")
+        return
+    cum = np.exp(log_rets.cumsum())
+    perf = float(cum.iloc[-1] - 1)
+    n_years = len(log_rets) / 252
+    ann_ret = float((1 + perf) ** (1 / max(n_years, 0.01)) - 1)
+    vol = float(log_rets.std() * np.sqrt(252))
+    sharpe = ann_ret / vol if vol > 1e-10 else np.nan
+    dd = float(((cum / cum.cummax()) - 1).min())
+    print(f"  {label}: {log_rets.index.min().date()} → {log_rets.index.max().date()} | {len(log_rets)} jours")
+    print(f"    Perf cumulée : {perf:+.2%}")
+    print(f"    Ret annualisé: {ann_ret:+.2%}")
+    print(f"    Vol annualisée: {vol:.2%}")
+    print(f"    Sharpe        : {sharpe:.2f}")
+    print(f"    Max Drawdown  : {dd:.2%}")
 
 
 def main() -> None:
     cfg = CoreConfig()
 
-    # 1-2) Equity : lecture + filtrage
-    wide_eq, summary_eq = lire_equity(cfg)
+    print("=" * 60)
+    print("  PIPELINE CORE v5 – Format wide unifié")
+    print(f"  Fichier : {Path(cfg.core_excel).name}")
+    print(f"  IS (sélection + calib) : {cfg.score_start} → {cfg.score_end}")
+    print(f"  OOS (validation)       : {cfg.oos_start} → {cfg.oos_end}")
+    print("=" * 60)
 
-    # 3) Rates / Credit : lecture depuis le fichier unifié
-    wide_rc, ticker_to_bucket = lire_rates_credit(cfg)
+    # ── 1) Lecture + filtrage des 3 thèmes ────────────────────────────────
+    print("\n[1/6] Lecture et filtrage des données...")
+    wide_eq, summary_eq, meta_eq = lire_theme(
+        cfg, "Equity", cfg.sheet_equity_prices, cfg.sheet_equity_meta,
+        exposure_keywords=cfg.equity_exposure_keywords)
+    wide_rt, summary_rt, meta_rt = lire_theme(
+        cfg, "Rates", cfg.sheet_rates_prices, cfg.sheet_rates_meta)
+    wide_cr, summary_cr, meta_cr = lire_theme(
+        cfg, "Credit", cfg.sheet_credit_prices, cfg.sheet_credit_meta)
 
-    # 4) Sélection 1 ETF par thème (scoring sur 2019-2020 uniquement : pas de look-ahead)
-    print("[4/7] Sélection pick_best (1 ETF / thème)...")
+    # ── 2) Sélection 1 ETF par thème ─────────────────────────────────────
+    print(f"\n[2/6] Sélection pick_best (1 ETF / thème)...")
     print(f"  Fenêtre de scoring : {cfg.score_start} → {cfg.score_end}")
 
-    rets_eq_full = np.log(wide_eq).diff()
-    rets_eq_calib = rets_eq_full.loc[cfg.score_start:cfg.score_end]
-    best_eq = pick_best_equity(wide_eq, rets_eq_calib, cfg.min_obs_pick_best)
-    print(f"  -> Equity : {best_eq}")
+    rets_eq_calib = np.log(wide_eq).diff().loc[cfg.score_start:cfg.score_end]
+    rets_rt_calib = np.log(wide_rt).diff().loc[cfg.score_start:cfg.score_end]
+    rets_cr_calib = np.log(wide_cr).diff().loc[cfg.score_start:cfg.score_end]
 
-    rets_rc_full = np.log(wide_rc).diff()
-    rets_rc_calib = rets_rc_full.loc[cfg.score_start:cfg.score_end]
-    themes = definir_themes()
-    best_rt = pick_best("Rates", wide_rc, rets_rc_calib, ticker_to_bucket, themes, cfg.min_obs_pick_best)
-    best_cr = pick_best("Credit", wide_rc, rets_rc_calib, ticker_to_bucket, themes, cfg.min_obs_pick_best)
+    best_eq = pick_best_theme("Equity", wide_eq, rets_eq_calib, cfg.min_obs_pick_best)
+    best_rt = pick_best_theme("Rates", wide_rt, rets_rt_calib, cfg.min_obs_pick_best)
+    best_cr = pick_best_theme("Credit", wide_cr, rets_cr_calib, cfg.min_obs_pick_best)
+
+    print(f"  -> Equity : {best_eq}")
     print(f"  -> Rates  : {best_rt}")
     print(f"  -> Credit : {best_cr}")
 
     core_etfs = [best_eq, best_rt, best_cr]
     core_themes = ["Equity", "Rates", "Credit"]
 
-    # Sauvegarde Core_finaux.csv (avec Ticker et Theme)
-    print("[5/7] Export Core_finaux.csv...")
-    df_core_finaux = pd.DataFrame({
-        "Ticker": core_etfs,
-        "Theme": core_themes,
-    })
+    # ── 3) Export sélection ───────────────────────────────────────────────
+    print(f"\n[3/6] Export sélection Core...")
+    Path(cfg.output_core_finaux_csv).parent.mkdir(parents=True, exist_ok=True)
+
+    df_core_finaux = pd.DataFrame({"Ticker": core_etfs, "Theme": core_themes})
     df_core_finaux.to_csv(cfg.output_core_finaux_csv, index=False)
     print(f"  -> {cfg.output_core_finaux_csv}")
 
-    # Sauvegarde core_selected_etfs.csv (ancien format)
     pd.DataFrame({"core_etfs": core_etfs, "theme": core_themes})\
         .to_csv(cfg.output_selected_core_csv, index=False)
     print(f"  -> {cfg.output_selected_core_csv}")
 
-    # Construire le wide combiné des 3 ETFs sélectionnés
+    # ── 4) Wide combiné + log-rendements des 3 ETFs ──────────────────────
+    print(f"\n[4/6] Construction du portefeuille Core...")
     wide_combined = pd.concat([
         wide_eq[[best_eq]],
-        wide_rc[[best_rt, best_cr]],
+        wide_rt[[best_rt]],
+        wide_cr[[best_cr]],
     ], axis=1).sort_index().dropna(how="all").ffill()
 
-    # Export log-rendements journaliers des 3 ETFs (pour frontière efficiente)
     core_etf_log_daily = np.log(wide_combined).diff().dropna()
-    etf_log_path = str(cfg.project_root / "outputs" / "core3_etf_daily_log_returns.csv")
+    etf_log_path = str(Path(cfg.output_core_daily_csv).parent / "core3_etf_daily_log_returns.csv")
     core_etf_log_daily.to_csv(etf_log_path)
     print(f"  -> {etf_log_path}")
 
-    # 6) Backtest rolling OOS
-    core_log_daily_oos = backtest_rolling_oos(
+    # ── 5) Backtest rolling : IS (2019-2020) + OOS (2021-2025) ─────────
+    print(f"\n[5/7] Backtest rolling (Max Sharpe contraint)...")
+
+    # IS : sélection et calibration sur 2019-2020
+    print(f"\n  --- IS ({cfg.score_start} → {cfg.score_end}) ---")
+    core_log_daily_is = backtest_rolling(
         wide_combined,
         lookback=cfg.lookback,
         rebal_freq=cfg.rebal_freq,
         w_min=cfg.w_min,
         w_max=cfg.w_max,
+        oos_start=cfg.score_start,
+        oos_end=cfg.score_end,
+        label="IS",
     )
-    core_log_daily_oos.to_frame().to_csv(cfg.output_core_daily_csv, index=True)
-    print(f"  -> {cfg.output_core_daily_csv}")
+    _print_perf_summary(core_log_daily_is, "IS")
 
-    print(f"Export OK : {cfg.output_core_daily_csv}")
+    core_log_daily_is.to_frame().to_csv(cfg.output_core_daily_is_csv, index=True)
+    print(f"    -> {cfg.output_core_daily_is_csv}")
+
+    # OOS : validation sur 2021-2025
+    print(f"\n  --- OOS ({cfg.oos_start} → {cfg.oos_end}) ---")
+    core_log_daily_oos = backtest_rolling(
+        wide_combined,
+        lookback=cfg.lookback,
+        rebal_freq=cfg.rebal_freq,
+        w_min=cfg.w_min,
+        w_max=cfg.w_max,
+        oos_start=cfg.oos_start,
+        oos_end=cfg.oos_end,
+        label="OOS",
+    )
+    _print_perf_summary(core_log_daily_oos, "OOS")
+
+    core_log_daily_oos.to_frame().to_csv(cfg.output_core_daily_csv, index=True)
+    print(f"    -> {cfg.output_core_daily_csv}")
+
+    # ── 6) Corrélations inter-ETFs ───────────────────────────────────────
+    print(f"\n[6/7] Corrélations inter-ETFs...")
+    rets_3etf = core_etf_log_daily.dropna()
+    for period, label in [(f"{cfg.score_start}/{cfg.score_end}", "IS"),
+                          (f"{cfg.oos_start}/{cfg.oos_end}", "OOS")]:
+        start, end = period.split("/")
+        r = rets_3etf.loc[start:end]
+        if len(r) > 30:
+            corr = r.corr()
+            print(f"\n  Corrélations {label} ({start} → {end}) :")
+            for i, t1 in enumerate(corr.columns):
+                for j, t2 in enumerate(corr.columns):
+                    if j > i:
+                        print(f"    {t1} vs {t2} : {corr.iloc[i, j]:.3f}")
+
+    # ── 7) Résumé ────────────────────────────────────────────────────────
+    print(f"\n[7/7] Résumé")
+    print("=" * 60)
+    for etf, theme in zip(core_etfs, core_themes):
+        print(f"  {theme:10s} : {etf}")
+    print(f"\n  IS  : {cfg.score_start} → {cfg.score_end}")
+    print(f"  OOS : {cfg.oos_start} → {cfg.oos_end}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
