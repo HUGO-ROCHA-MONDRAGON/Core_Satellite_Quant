@@ -158,14 +158,25 @@ def metriques_base(returns: pd.Series) -> dict:
     }
 
 
-def sauvegarder_outputs(cfg: PortfolioConfig, returns_port: pd.Series, scale_lag: pd.Series) -> None:
-    """Sauvegarde rendements et poids effectifs après scaling."""
+def sauvegarder_outputs(
+    cfg: PortfolioConfig,
+    returns_port: pd.Series,
+    scale_lag: pd.Series,
+    w_core_eff: pd.Series | None = None,
+    w_sat_eff: pd.Series | None = None,
+) -> None:
+    """Sauvegarde rendements et poids effectifs après scaling asymétrique."""
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     returns_port.to_frame("portfolio_return").to_csv(cfg.output_returns_csv, index=True)
 
-    w_sat_eff = cfg.w_sat * scale_lag
-    w_core_eff = (1.0 - cfg.w_sat) * scale_lag
+    # Poids effectifs : fournis explicitement (vol targeting asymétrique)
+    # ou calculés symétriquement par défaut pour compatibilité descendante.
+    if w_core_eff is None:
+        w_core_eff = (1.0 - cfg.w_sat) * scale_lag
+    if w_sat_eff is None:
+        w_sat_eff = pd.Series(cfg.w_sat, index=scale_lag.index)
+
     weights = pd.DataFrame(
         {"w_core_effectif": w_core_eff, "w_sat_effectif": w_sat_eff, "scale": scale_lag},
         index=returns_port.index,
@@ -213,14 +224,35 @@ def main() -> None:
     vol_brut = brut.std() * np.sqrt(12)
     print(f"  -> Volatilité brute (avant targeting): {vol_brut:.4f}")
 
-    print("[3/6] Application du volatility targeting...")
-    port, scale_lag = appliquer_vol_targeting(
+    print("[3/6] Application du volatility targeting asymétrique...")
+    # Calcul du scale_lag à partir de la volatilité du portefeuille brut (signal de risk)
+    _, scale_lag = appliquer_vol_targeting(
         returns_brut=brut,
         target_vol=cfg.target_vol,
         lookback_months=cfg.vol_lookback_months,
         scale_min=cfg.scale_min,
         scale_max=cfg.scale_max,
     )
+
+    # Vol targeting asymétrique : ne réduit que le Core pour préserver la
+    # décorrélation structurelle du Satellite
+    w_core_base = 1.0 - cfg.w_sat
+    w_core_eff = w_core_base * scale_lag          # Core scalé par le signal de vol
+    w_sat_eff  = pd.Series(cfg.w_sat, index=scale_lag.index)  # Satellite fixe
+
+    # Renormaliser si l'exposition totale dépasse 100 % (cas scale_lag > 1)
+    total_eff = w_core_eff + w_sat_eff
+    norm_mask = total_eff > 1.0
+    w_core_eff[norm_mask] = w_core_eff[norm_mask] / total_eff[norm_mask]
+    w_sat_eff[norm_mask]  = w_sat_eff[norm_mask]  / total_eff[norm_mask]
+
+    # Rendements du portefeuille avec poids effectifs asymétriques
+    core_aligned = core.reindex(scale_lag.index)
+    sat_aligned  = sat.reindex(scale_lag.index)
+    port = (w_core_eff * core_aligned + w_sat_eff * sat_aligned).dropna()
+    scale_lag  = scale_lag.reindex(port.index)
+    w_core_eff = w_core_eff.reindex(port.index)
+    w_sat_eff  = w_sat_eff.reindex(port.index)
 
     print(f"  -> Scale moyen: {scale_lag.mean():.3f}")
     print(f"  -> Scale min observé: {scale_lag.min():.3f}")
@@ -237,7 +269,7 @@ def main() -> None:
             print(f"{k}: {v:.4f}")
 
     print("[5/6] Sauvegarde outputs...")
-    sauvegarder_outputs(cfg, port, scale_lag)
+    sauvegarder_outputs(cfg, port, scale_lag, w_core_eff=w_core_eff, w_sat_eff=w_sat_eff)
 
     print("[6/6] Terminé")
 

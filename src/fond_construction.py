@@ -8,8 +8,14 @@ Objectifs :
   - Frais totaux ≤ 80 bps/an
   - Volatilité totale cible 8-12 %
   - Poche Core 70-75 %  (rebalancement trimestriel sans réoptimisation)
-  - Poche Satellite 25-30 %  (poids equal-weight 1/n)
+  - Poche Satellite 25-30 %  (allocation décorrélation-first, mode beta_inverse par défaut)
   - Satellite : alpha > 0 vs Core, beta rolling 3 M ≈ 0
+
+Allocation satellite :
+  La poche satellite est construite selon le principe décorrélation-first via
+  `poids_satellite_decorr_first` (3 modes : beta_inverse, score_prop, min_corr).
+  Tous les calculs d'allocation sont strictement sur la fenêtre de calibration
+  (2019-01-01 → 2020-12-31) pour éviter tout look-ahead biais.
 """
 
 from __future__ import annotations
@@ -75,6 +81,12 @@ class FondConfig:
     # ── Rebalancement trimestriel (~63 jours ouvrés) ──────────────────────────
     rebal_freq_days: int = 63
 
+    # ── Mode d'allocation satellite ───────────────────────────────────────────
+    # "beta_inverse" : w_i ∝ 1/(|β_i| + ε)  — simple et robuste (défaut)
+    # "score_prop"   : softmax des scores IS de satellite_selected_v3.csv
+    # "min_corr"     : minimisation de la variance intra-satellite (scipy SLSQP)
+    satellite_alloc_mode: str = "beta_inverse"
+
     # ── Fichiers d'entrée ────────────────────────────────────────────────────
     core_daily_csv:       str = str(project_root / "outputs" / "core_returns_daily_oos.csv")
     core_daily_is_csv:    str = str(project_root / "outputs" / "core_returns_daily_is.csv")
@@ -84,6 +96,7 @@ class FondConfig:
     core_meta_excel:      str = str(project_root / "data" / "univers_core_etf_eur_daily_wide_VF.xlsx")
     core_meta_sheets:     tuple = ("Equity", "Rates", "Credit")
     satellite_selected_csv: str = str(project_root / "outputs" / "satellite_selected.csv")
+    satellite_selected_v3_csv: str = str(project_root / "outputs" / "satellite_selected_v3.csv")
     price_paths: List[str] = field(default_factory=lambda: [
         str(project_root / "data" / "STRAT1_price.xlsx"),
         str(project_root / "data" / "STRAT2_price.xlsx"),
@@ -301,8 +314,233 @@ def poids_satellite_equal_weight(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Calibration de l'allocation Core / Satellite
+#  Poids satellite : décorrélation-first (beta_inverse | score_prop | min_corr)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def poids_satellite_decorr_first(
+    sat_rets_calib: pd.DataFrame,
+    core_rets_calib: pd.Series,
+    cfg: FondConfig,
+    blocs_dict: Dict[str, List[str]] | None = None,
+    scores_is: pd.Series | None = None,
+    mode: str = "beta_inverse",
+) -> pd.Series:
+    """
+    Allocation décorrélation-first de la poche satellite.
+
+    L'approche Core-Satellite repose sur la décorrélation structurelle entre Core
+    et Satellite.  Cette fonction alloue les poids de la poche satellite en
+    exploitant explicitement l'information IS sur la corrélation de chaque fonds
+    avec le Core, plutôt qu'en équipondérant aveuglément.
+
+    Trois modes sont supportés :
+
+    beta_inverse (défaut) :
+        w_i ∝ 1 / (|β_i| + ε) avec ε = 0.05.
+        Les fonds les moins directionnels par rapport au Core (|β| proche de 0)
+        reçoivent plus de poids. Simple, robuste, sans optimisation.
+
+    score_prop :
+        w_i ∝ exp(score_i - max(scores)).  Softmax numériquement stable des scores
+        composites IS produits par satellite_pipeline.main() (où 40 % du score
+        reflète la décorrélation).  Fallback vers beta_inverse si le fichier v3
+        n'existe pas ou si les scores sont tous NaN pour les fonds retenus.
+
+    min_corr :
+        Minimise w^T Σ_sat w sous la contrainte Σw = 1 et bornes [0.02, 0.60],
+        en utilisant scipy.optimize.minimize (SLSQP).  Σ_sat est calculée sur la
+        calib window uniquement.  Fallback vers beta_inverse si l'optimisation
+        échoue.
+
+    Dans tous les modes, une contrainte min-par-bloc est appliquée en post-
+    traitement : si un bloc ne reçoit pas au minimum cfg.min_weight_per_bloc du
+    poids satellite total, ses fonds sont boostés proportionnellement.
+
+    Anti look-ahead : tous les calculs (beta OLS, covariance Σ_sat, scores IS)
+    sont strictement limités à cfg.calib_start : cfg.calib_end.
+
+    Parameters
+    ----------
+    sat_rets_calib : pd.DataFrame
+        Rendements journaliers des fonds satellite sur la fenêtre de calibration.
+    core_rets_calib : pd.Series
+        Rendements journaliers du Core sur la fenêtre de calibration.
+    cfg : FondConfig
+        Configuration incluant calib_start, calib_end, min_weight_per_bloc.
+    blocs_dict : dict, optional
+        Mapping bloc_name → [tickers], pour la contrainte min-par-bloc.
+    scores_is : pd.Series, optional
+        Scores composites IS (ticker → score), issus de satellite_selected_v3.csv.
+        Utilisé uniquement avec mode="score_prop".
+    mode : str
+        "beta_inverse" | "score_prop" | "min_corr"
+
+    Returns
+    -------
+    pd.Series
+        Poids normalisés (somme = 1) indexés par ticker.
+    """
+    # ── 1. Filtrage : fonds avec observations suffisantes sur calib ───────────
+    combined = pd.concat(
+        [core_rets_calib.rename("core"), sat_rets_calib], axis=1, sort=False
+    ).sort_index()
+    combined = combined.loc[cfg.calib_start:cfg.calib_end].dropna(subset=["core"])
+
+    min_obs = max(60, int(0.30 * len(combined)))
+    valid = [
+        t for t in sat_rets_calib.columns
+        if t in combined.columns and combined[t].dropna().shape[0] >= min_obs
+    ]
+    if not valid:
+        raise ValueError("Aucun fonds satellite avec données suffisantes sur la calib window.")
+
+    if blocs_dict:
+        for bloc_name, bloc_tickers in blocs_dict.items():
+            if not any(t in valid for t in bloc_tickers):
+                print(f"  ⚠  Bloc '{bloc_name}' : aucun fonds retenu")
+
+    n = len(valid)
+
+    # ── 2. Calcul des betas IS (utilisés par beta_inverse + fallback) ─────────
+    # Strictement sur calib_start:calib_end pour éviter le look-ahead biais.
+    betas: Dict[str, float] = {}
+    for t in valid:
+        ts = combined[t].dropna()
+        if len(ts) >= 30:
+            core_t = combined["core"].reindex(ts.index).dropna()
+            ts_aligned = ts.reindex(core_t.index)
+            if len(ts_aligned) >= 30:
+                _, b = _ols(ts_aligned.values, core_t.values)
+                betas[t] = b
+            else:
+                betas[t] = 1.0  # fallback : corrélation totale supposée
+        else:
+            betas[t] = 1.0  # fallback : moins de 30 observations disponibles
+
+    # ── 3. Allocation selon le mode ───────────────────────────────────────────
+    effective_mode = mode
+
+    # Vérification préalable pour score_prop
+    if mode == "score_prop":
+        if scores_is is None or scores_is.reindex(valid).dropna().empty:
+            print("  ⚠  scores_is absent ou tous NaN → fallback vers beta_inverse")
+            effective_mode = "beta_inverse"
+
+    if effective_mode == "beta_inverse":
+        eps = 0.05
+        inv_beta = np.array([1.0 / (abs(betas[t]) + eps) for t in valid])
+        w_raw = inv_beta / inv_beta.sum()
+
+    elif effective_mode == "score_prop":
+        sc = scores_is.reindex(valid)
+        # Imputer la médiane pour les éventuels NaN résiduels
+        sc = sc.fillna(float(sc.median()))
+        sc_vals = sc.values.astype(float)
+        sc_vals -= sc_vals.max()  # stabilité numérique (log-sum-exp)
+        exp_sc = np.exp(sc_vals)
+        w_raw = exp_sc / exp_sc.sum()
+
+    elif effective_mode == "min_corr":
+        try:
+            from scipy.optimize import minimize as scipy_minimize
+        except ImportError:
+            print("  ⚠  scipy non disponible → fallback vers beta_inverse")
+            effective_mode = "beta_inverse"
+            eps = 0.05
+            inv_beta = np.array([1.0 / (abs(betas[t]) + eps) for t in valid])
+            w_raw = inv_beta / inv_beta.sum()
+        else:
+            # Matrice de covariance intra-satellite sur calib window uniquement
+            sat_mat = combined[valid].dropna(how="all")
+            cov_sat = sat_mat.cov().values.astype(float)
+            if np.isnan(cov_sat).any():
+                cov_sat = np.nan_to_num(cov_sat, nan=0.0)
+                np.fill_diagonal(cov_sat, np.diag(cov_sat) + 1e-8)
+
+            def _objective(w: np.ndarray) -> float:
+                return float(w @ cov_sat @ w)
+
+            def _jac(w: np.ndarray) -> np.ndarray:
+                return 2.0 * cov_sat @ w
+
+            constraints = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}]
+            bounds = [(0.02, 0.60)] * n
+            result = scipy_minimize(
+                _objective,
+                np.ones(n) / n,
+                jac=_jac,
+                method="SLSQP",
+                bounds=bounds,
+                constraints=constraints,
+                options={"ftol": 1e-9, "maxiter": 1000},
+            )
+            if result.success:
+                w_raw = np.maximum(result.x, 0.0)
+                w_raw /= w_raw.sum()
+            else:
+                print(
+                    f"  ⚠  min_corr optimisation échouée ({result.message}) "
+                    "→ fallback vers beta_inverse"
+                )
+                effective_mode = "beta_inverse"
+                eps = 0.05
+                inv_beta = np.array([1.0 / (abs(betas[t]) + eps) for t in valid])
+                w_raw = inv_beta / inv_beta.sum()
+
+    else:
+        raise ValueError(
+            f"Mode d'allocation inconnu : '{mode}'. "
+            "Valeurs valides : beta_inverse, score_prop, min_corr."
+        )
+
+    # ── 4. Contrainte min-par-bloc ────────────────────────────────────────────
+    if blocs_dict and cfg.min_weight_per_bloc > 0.0:
+        w_dict: Dict[str, float] = dict(zip(valid, w_raw.tolist()))
+        for _iter in range(10):
+            changed = False
+            for bloc_name, bloc_tickers in blocs_dict.items():
+                bloc_in_valid = [t for t in bloc_tickers if t in w_dict]
+                if not bloc_in_valid:
+                    continue
+                bloc_w = sum(w_dict[t] for t in bloc_in_valid)
+                if bloc_w < cfg.min_weight_per_bloc - 1e-9:
+                    deficit = cfg.min_weight_per_bloc - bloc_w
+                    boost_per_fund = deficit / len(bloc_in_valid)
+                    for t in bloc_in_valid:
+                        w_dict[t] += boost_per_fund
+                    # Réduire proportionnellement les fonds hors du bloc
+                    others = [t for t in valid if t not in bloc_in_valid]
+                    total_others = sum(w_dict[t] for t in others)
+                    if total_others > deficit:
+                        for t in others:
+                            w_dict[t] -= deficit * (w_dict[t] / total_others)
+                    changed = True
+            # Renormalisation après chaque passe
+            total_w = sum(w_dict.values())
+            if total_w > 1e-10:
+                w_dict = {t: v / total_w for t, v in w_dict.items()}
+            if not changed:
+                break
+        w_raw = np.array([w_dict[t] for t in valid])
+
+    # Renormalisation finale
+    w_raw = np.maximum(w_raw, 0.0)
+    w_raw /= w_raw.sum()
+
+    # ── 5. Logging ────────────────────────────────────────────────────────────
+    print(f"\n  Mode d'allocation satellite : {effective_mode}")
+    print(f"  {'Ticker':<30s}  {'Poids':>6}  {'Beta IS':>8}")
+    print("  " + "-" * 52)
+    w_series = pd.Series(w_raw, index=valid, name="weight")
+    for t, w in w_series.sort_values(ascending=False).items():
+        b = betas.get(t, float("nan"))
+        print(f"  {t:<30s}  {w:6.1%}  {b:+8.3f}")
+    print(f"  {'TOTAL':<30s}  {w_series.sum():6.1%}")
+
+    return w_series
+
+
+
 
 def calibrer_allocation(
     core_rets_calib: pd.Series,
@@ -408,8 +646,14 @@ def backtest(
         if valid.any():
             w_valid = w_s[valid]
             denom = w_valid.sum()
-            sat_p_rets[idx] = ((w_valid / denom) @ r_s[valid]) if denom > 1e-10 else 0.0
-            port_rets[idx] = w_c * r_c + (w_valid @ r_s[valid])
+            if denom > 1e-10:
+                sat_ret_t = float((w_valid / denom) @ r_s[valid])
+            else:
+                sat_ret_t = 0.0
+            sat_p_rets[idx] = sat_ret_t
+            # Le portfolio utilise w_sat total × rendement poche renormalisé
+            # → cohérence garantie entre sat_p_rets et port_rets
+            port_rets[idx] = w_c * r_c + w_sat * sat_ret_t
         else:
             sat_p_rets[idx] = 0.0
             port_rets[idx] = w_c * r_c
@@ -582,6 +826,19 @@ def main() -> None:
     sat_info     = pd.read_csv(cfg.satellite_selected_csv)
     tickers_sat  = sat_info["ticker"].tolist()
 
+    # Lecture optionnelle des scores IS depuis satellite_selected_v3.csv
+    scores_is: pd.Series | None = None
+    v3_path = Path(cfg.satellite_selected_v3_csv)
+    if v3_path.exists():
+        try:
+            df_v3 = pd.read_csv(v3_path)
+            if "ticker" in df_v3.columns and "score" in df_v3.columns:
+                scores_is = df_v3.set_index("ticker")["score"].dropna()
+                print(f"    Scores IS chargés depuis satellite_selected_v3.csv "
+                      f"({len(scores_is)} fonds)")
+        except Exception as e:
+            print(f"  ⚠  Impossible de lire satellite_selected_v3.csv : {e}")
+
     # expense_pct en % (ex. 0.95 = 0.95 %) → conversion en bps
     fees_bps = (
         sat_info.set_index("ticker")["expense_pct"] * 100.0
@@ -624,17 +881,26 @@ def main() -> None:
         blocs_dict.setdefault(b, []).append(row["ticker"])
     print(f"\n  Blocs ({len(blocs_dict)}) :", {b: len(v) for b, v in blocs_dict.items()})
 
-    # ── [4] Allocation equal-weight des fonds satellite ──────────────────────
-    print("\n[2] Allocation equal-weight des poids satellite...")
-    sat_weights = poids_satellite_equal_weight(sat_rets_calib, core_calib, cfg, blocs_dict)
+    # ── [4] Allocation décorrélation-first des fonds satellite ───────────────
+    # Sélection automatique du mode : score_prop si les scores IS sont disponibles
+    # pour les fonds retenus, sinon cfg.satellite_alloc_mode (défaut: beta_inverse).
+    if (
+        scores_is is not None
+        and not scores_is.reindex(tickers_with_backtest).dropna().empty
+        and cfg.satellite_alloc_mode == "beta_inverse"
+    ):
+        alloc_mode = "score_prop"
+    else:
+        alloc_mode = cfg.satellite_alloc_mode
 
-    print(f"\n  Poids satellite (equal-weight 1/n) :")
-    for ticker, w in sat_weights.sort_values(ascending=False).items():
-        bloc = sat_info.loc[sat_info["ticker"] == ticker, "bloc"].values
-        bloc_str = bloc[0] if len(bloc) else "?"
-        strat = sat_info.loc[sat_info["ticker"] == ticker, "strategie"].values
-        strat_str = strat[0] if len(strat) else "?"
-        print(f"    {ticker:<30s}  {w:6.1%}   [{bloc_str} – {strat_str}]")
+    print(f"\n[2] Allocation satellite (mode : {alloc_mode})...")
+    sat_weights = poids_satellite_decorr_first(
+        sat_rets_calib, core_calib, cfg, blocs_dict,
+        scores_is=scores_is,
+        mode=alloc_mode,
+    )
+    # Récupération du mode effectivement utilisé (peut différer si fallback)
+    alloc_mode_used = alloc_mode
 
     # ── [4] Rendements de la poche satellite sur calib ────────────────────────
     sat_rets_calib_sel = sat_rets_calib[sat_weights.index]
@@ -778,6 +1044,7 @@ def main() -> None:
     weights_out["w_core"] = w_core_eff
     weights_out["w_sat"]  = w_sat_eff
     weights_out["portfolio_scale"] = scale_total
+    weights_out["allocation_mode"] = alloc_mode_used
     weights_out.to_csv(cfg.output_weights_csv)
     print(f"  -> {cfg.output_weights_csv}")
 
