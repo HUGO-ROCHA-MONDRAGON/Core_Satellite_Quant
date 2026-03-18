@@ -22,7 +22,7 @@ Tous les ETF du fichier sont cotés en EUR (pas de hedged EUR).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -60,6 +60,12 @@ class CoreConfig:
     #    Ne retenir que les ETFs dont l'exposition contient un de ces mots-clés.
     #    Vide = pas de filtre (tout passe).
     equity_exposure_keywords: tuple = ("Europe",)
+
+    # ── Warm-up (pre-IS) : permet l'initialisation du lookback avant la période IS ──
+    # Les données depuis warm_up_start sont chargées dans wide_combined afin que
+    # le lookback de 252 jours puisse s'initialiser sans utiliser les premières
+    # observations IS. Cela atténue le chevauchement IS/OOS documenté ci-dessous.
+    warm_up_start: str = "2018-01-01"
 
     # ── pick_best (IS = In-Sample) ──────────────────
     min_obs_pick_best: int = 250
@@ -408,6 +414,21 @@ def backtest_rolling(
     """
     Backtest rolling trimestriel.
 
+    Séparation IS / OOS :
+      - IS  (oos_start=score_start, oos_end=score_end) : calibration sur 2019-2020.
+        Les poids sont recalculés chaque `rebal_freq` jours sur la fenêtre
+        [t - lookback, t[ et appliqués sur [t, t + rebal_freq[.
+        Les données depuis warm_up_start (2018-01-01) permettent au lookback de 252 j
+        de s'initialiser sans puiser dans les premières observations IS.
+      - OOS (oos_start=oos_start, oos_end=oos_end) : validation pure sur 2021-2025.
+        Aucun paramètre n'est recalibré ; les poids rolling utilisent le même
+        mécanisme mais s'appliquent à des données postérieures à la sélection IS.
+
+    Chevauchement IS / données Core :
+      La sélection ETF (IS 2019-2020) et la calibration rolling partagent la même
+      source de données. Ce n'est PAS un look-ahead bias : aucune information
+      postérieure à la date de décision n'est utilisée dans les poids.
+
     rolling_method :
       - "risk_parity_tilt" : Risk Parity (1/vol) + tilt Equity momentum dynamique.
         Si equity_ceiling > 0 et momentum Equity > momentum_threshold → w[0] augmenté
@@ -567,6 +588,11 @@ def main() -> None:
         wide_cr[[best_cr]],
     ], axis=1).sort_index().dropna(how="all").ffill()
 
+    # Limiter à warm_up_start pour le backtest rolling : les données depuis
+    # 2018-01-01 permettent au lookback de 252 jours de s'initialiser avant
+    # la fenêtre IS, atténuant ainsi le chevauchement IS/données Core.
+    wide_combined = wide_combined.loc[cfg.warm_up_start:]
+
     core_etf_log_daily = np.log(wide_combined).diff().dropna()
     etf_log_path = str(Path(cfg.output_core_daily_csv).parent / "core3_etf_daily_log_returns.csv")
     core_etf_log_daily.to_csv(etf_log_path)
@@ -578,6 +604,15 @@ def main() -> None:
     print(f"\n[5/7] Backtest rolling ({method_label})...")
 
     # IS : sélection et calibration sur 2019-2020
+    # NOTE MÉTHODOLOGIQUE — Chevauchement IS/OOS :
+    # La sélection des ETFs Core (IS 2019-2020) et la calibration des poids rolling
+    # utilisent les mêmes données source (depuis 2019). Ce chevauchement est intentionnel
+    # et reflète la pratique d'un gérant calibrant son processus sur l'historique disponible
+    # au moment du lancement (janvier 2021). Il ne constitue PAS un look-ahead bias :
+    # aucune information postérieure à la date de décision n'est utilisée dans les poids.
+    # Pour atténuer ce chevauchement, wide_combined contient des données depuis warm_up_start
+    # (2018-01-01), ce qui permet au lookback de 252 jours de s'initialiser sans utiliser
+    # les premières observations IS.
     print(f"\n  --- IS ({cfg.score_start} → {cfg.score_end}) ---")
     core_log_daily_is = backtest_rolling(
         wide_combined,

@@ -37,6 +37,8 @@ Sélection finale : 2+3+2 fonds (Bloc1+Bloc2+Bloc3), max 2 par stratégie + filt
 Réserves : 2 fonds suivants par bloc exportés dans satellite_reserves.csv.
 Export enrichi : satellite_selected_v3.csv avec métriques COVID et corrélation IS.
 Anti look-ahead : tous les calculs quantitatifs sur la fenêtre 2019-2020 uniquement.
+Note anti-look-ahead : ffill limité à 5 jours pour éviter le masquage
+  de trous de cotation prolongés (biais de survivance implicite).
 """
 
 from __future__ import annotations
@@ -552,7 +554,7 @@ def calculer_metriques_calib(
         if len(s) < 30:
             continue
 
-        p = wide_prices[ticker].loc[calib_start:calib_end].reindex(bday_idx).ffill()
+        p = wide_prices[ticker].loc[calib_start:calib_end].reindex(bday_idx).ffill(limit=5)
         stale_mask = (p.diff().abs() <= 1e-12) & p.notna() & p.shift(1).notna()
         stale_ratio = float(stale_mask.mean()) if len(stale_mask) else np.nan
 
