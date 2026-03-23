@@ -41,6 +41,8 @@ import matplotlib.ticker as mtick
 import numpy as np
 import pandas as pd
 
+from src.risk_free import get_bund_risk_free_daily
+
 
 matplotlib.use("Agg")
 
@@ -118,9 +120,19 @@ def _roll_vol(returns: pd.Series, window: int = 63) -> pd.Series:
     return returns.rolling(window).std() * np.sqrt(252)
 
 
-def _roll_sharpe(returns: pd.Series, window: int = 63) -> pd.Series:
-    """Sharpe rolling annualisé."""
-    roll_ret = returns.rolling(window).mean() * 252
+def _roll_sharpe(
+    returns: pd.Series,
+    rf_daily: pd.Series | None = None,
+    window: int = 63,
+) -> pd.Series:
+    """Sharpe rolling annualisé (exces rf si fourni)."""
+    if rf_daily is None:
+        excess = returns
+    else:
+        rf_aligned = rf_daily.reindex(returns.index).ffill().fillna(0.0)
+        excess = returns - rf_aligned
+
+    roll_ret = excess.rolling(window).mean() * 252
     roll_vol = returns.rolling(window).std() * np.sqrt(252)
     return roll_ret / roll_vol.replace(0.0, np.nan)
 
@@ -292,14 +304,18 @@ def plot_A04_core_rolling_vol(r_core: pd.Series, cfg: PlotConfig) -> None:
     _save(cfg.fig_dir, "A04_core_rolling_vol.png", cfg.dpi)
 
 
-def plot_A05_core_rolling_sharpe(r_core: pd.Series, cfg: PlotConfig) -> None:
-    """A05 – Sharpe rolling du Core."""
+def plot_A05_core_rolling_sharpe(
+    r_core: pd.Series,
+    rf_daily: pd.Series,
+    cfg: PlotConfig,
+) -> None:
+    """A05 – Sharpe rolling du Core (exces rf Bund)."""
     fig, ax = plt.subplots(figsize=(10, 4))
-    _roll_sharpe(r_core).plot(ax=ax, color="#e6194b")
+    _roll_sharpe(r_core, rf_daily=rf_daily).plot(ax=ax, color="#e6194b")
     ax.axhline(0, color="black", lw=0.8, ls="--")
-    ax.set_title("A05 – Sharpe rolling 63j du Core")
+    ax.set_title("A05 – Sharpe rolling 63j du Core (exces rf Bund)")
     ax.set_xlabel("Date")
-    ax.set_ylabel("Sharpe")
+    ax.set_ylabel("Sharpe (exces rf)")
     _save(cfg.fig_dir, "A05_core_rolling_sharpe.png", cfg.dpi)
 
 
@@ -883,6 +899,9 @@ def main() -> None:
     r_core = pd.to_numeric(bt["core_ret"], errors="coerce").dropna()
     r_sat = pd.to_numeric(bt["sat_pocket_ret"], errors="coerce").dropna()
 
+    rf_daily, rf_source = get_bund_risk_free_daily(bt.index)
+    print(f"    Risk-free Bund : {rf_source}")
+
     weights_df = pd.read_csv(cfg.fond_weights_csv, index_col=0)
     sat_weights = pd.to_numeric(
         weights_df["theta_satellite"], errors="coerce"
@@ -920,7 +939,7 @@ def main() -> None:
     plot_A02_core_portfolio_cum(r_core_oos.loc[r_port.index.min() :], cfg)
     plot_A03_core_drawdown(r_core, cfg)
     plot_A04_core_rolling_vol(r_core, cfg)
-    plot_A05_core_rolling_sharpe(r_core, cfg)
+    plot_A05_core_rolling_sharpe(r_core, rf_daily, cfg)
     plot_A06_core_annual_bar(annual, cfg)
     plot_A07_core_fees_bar(core_finaux, cfg)
 

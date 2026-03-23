@@ -32,6 +32,8 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from scipy.optimize import minimize
 
+from src.risk_free import get_bund_risk_free_daily, sharpe_excess
+
 project_root = Path(__file__).resolve().parent.parent
 
 
@@ -73,19 +75,29 @@ def _stats_daily(log_rets: pd.DataFrame, weights: np.ndarray) -> Tuple[np.ndarra
     return mu, cov
 
 
-def _port_stats(w: np.ndarray, mu: np.ndarray, cov: np.ndarray) -> Tuple[float, float, float]:
+def _port_stats(
+    w: np.ndarray,
+    mu: np.ndarray,
+    cov: np.ndarray,
+    rf_ann: float = 0.0,
+) -> Tuple[float, float, float]:
     """Rendement, vol, Sharpe annualisés d'un portefeuille."""
     r = float(w @ mu)
     v = float(np.sqrt(w @ cov @ w))
-    s = r / v if v > 1e-10 else np.nan
+    s = (r - rf_ann) / v if v > 1e-10 else np.nan
     return r, v, s
 
 
-def _batch_stats(W: np.ndarray, mu: np.ndarray, cov: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _batch_stats(
+    W: np.ndarray,
+    mu: np.ndarray,
+    cov: np.ndarray,
+    rf_ann: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(ret, vol, sharpe) pour une matrice N×k de poids."""
     rets   = W @ mu
     vols   = np.sqrt(np.einsum("ij,jk,ik->i", W, cov, W))
-    sharpe = np.where(vols > 1e-10, rets / vols, np.nan)
+    sharpe = np.where(vols > 1e-10, (rets - rf_ann) / vols, np.nan)
     return rets, vols, sharpe
 
 
@@ -247,12 +259,16 @@ def _backtest_rolling(
     return s.loc[oos_start:oos_end].rename("ret")
 
 
-def _perf_metrics(ret: pd.Series) -> Dict:
+def _perf_metrics(ret: pd.Series, rf_daily: pd.Series | None = None) -> Dict:
     """Métriques annualisées à partir de rendements simples journaliers."""
     n = len(ret)
     ann_ret = float((1 + ret).prod() ** (252 / n) - 1) if n > 0 else np.nan
     ann_vol = float(ret.std() * np.sqrt(252))
-    sharpe  = ann_ret / ann_vol if ann_vol > 1e-10 else np.nan
+    if rf_daily is None:
+        sharpe = ann_ret / ann_vol if ann_vol > 1e-10 else np.nan
+    else:
+        rf_aligned = rf_daily.reindex(ret.index).ffill().fillna(0.0)
+        sharpe = sharpe_excess(ret, rf_aligned)
     cum     = (1 + ret).cumprod()
     mdd     = float(((cum / cum.cummax()) - 1).min())
     return {"ret_ann": ann_ret, "vol_ann": ann_vol, "sharpe": sharpe, "mdd": mdd}
@@ -277,11 +293,12 @@ def _plot_frontier(
     strategies: Dict,
     tickers: List[str],
     fig_dir: Path, dpi: int,
+    sharpe_label: str = "Sharpe (IS)",
 ) -> None:
     fig, ax = plt.subplots(figsize=(9, 6))
     sc = ax.scatter(sim_vols, sim_rets, c=sim_sharpe, cmap="viridis",
                     s=5, alpha=0.3, label="_nolegend_")
-    plt.colorbar(sc, ax=ax, label="Sharpe (IS)")
+    plt.colorbar(sc, ax=ax, label=sharpe_label)
 
     markers = {"Max Sharpe": "*", "Min Variance": "D", "Equal Weight": "P",
                "Risk Parity": "^", "Max Sharpe Rolling": "s", "Risk Parity + Tilt": "h"}
@@ -291,7 +308,7 @@ def _plot_frontier(
         w = d["w"]
         ax.scatter(d["vol_is"], d["ret_is"], marker=markers.get(name, "o"),
                    s=160, zorder=5, color=COLORS.get(name, "grey"),
-                   label=f"{name}  Sharpe={d['sharpe_is']:.2f}")
+                   label=f"{name}  Sharpe(exces rf)={d['sharpe_is']:.2f}")
         for i, t in enumerate(tickers):
             ax.annotate(f"{w[i]:.0%}", (d["vol_is"], d["ret_is"]),
                         textcoords="offset points", xytext=(6, -4*(i-1)),
@@ -330,8 +347,8 @@ def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
                    color=[COLORS.get(n, "grey") for n in names])
     ax2.set_xticks(range(len(names)))
     ax2.set_xticklabels(names, rotation=25, ha="right", fontsize=8)
-    ax2.set_title("Sharpe OOS 2021-2025 par stratégie")
-    ax2.set_ylabel("Sharpe")
+    ax2.set_title("Sharpe OOS (exces rf) 2021-2025 par stratégie")
+    ax2.set_ylabel("Sharpe (exces rf)")
     ax2.axhline(0, color="black", lw=0.8)
     for bar, v in zip(bars, sharpes):
         ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
@@ -366,6 +383,12 @@ def main() -> None:
     print(f"  ETFs : {tickers}")
     print(f"  Période : {df.index.min().date()} → {df.index.max().date()}")
 
+    rf_daily_all, rf_source = get_bund_risk_free_daily(df.index)
+    rf_is = rf_daily_all.reindex(df.loc[cfg.calib_start:cfg.calib_end].index).ffill().fillna(0.0)
+    rf_oos = rf_daily_all.reindex(df.loc[cfg.oos_start:cfg.oos_end].index).ffill().fillna(0.0)
+    rf_ann_is = float(rf_is.mean() * 252) if len(rf_is) else 0.0
+    print(f"  Risk-free Bund : {rf_source}")
+
     # ── Fenêtres ──────────────────────────────────────────────────────────────
     is_df  = df.loc[cfg.calib_start:cfg.calib_end].dropna()
     oos_df = df.loc[cfg.oos_start:cfg.oos_end].dropna()
@@ -376,7 +399,7 @@ def main() -> None:
     # ── Portefeuilles simulés sur IS ──────────────────────────────────────────
     print("\n[2] Simulation de la frontière (IS)...")
     W_sim  = _sim_portfolios(len(tickers), cfg.n_sim)
-    s_rets, s_vols, s_sharpes = _batch_stats(W_sim, mu_is, cov_is)
+    s_rets, s_vols, s_sharpes = _batch_stats(W_sim, mu_is, cov_is, rf_ann=rf_ann_is)
 
     # ── 4 stratégies statiques ────────────────────────────────────────────────
     print("\n[3] Optimisation des 4 stratégies statiques sur IS...")
@@ -389,18 +412,22 @@ def main() -> None:
 
     strategies: Dict = {}
     for name, w in strat_configs.items():
-        r_is, v_is, s_is = _port_stats(w, mu_is, cov_is)
+        r_is, v_is, s_is = _port_stats(w, mu_is, cov_is, rf_ann=rf_ann_is)
         oos_ret = _backtest_fixed(oos_df, w)
-        m_oos   = _perf_metrics(oos_ret)
+        is_ret = _backtest_fixed(is_df, w)
+        m_is = _perf_metrics(is_ret, rf_is)
+        m_oos   = _perf_metrics(oos_ret, rf_oos)
         strategies[name] = {
             "w":          w,
-            "ret_is":     r_is,  "vol_is": v_is, "sharpe_is": s_is,
+            "ret_is":     m_is["ret_ann"],
+            "vol_is":     m_is["vol_ann"],
+            "sharpe_is":  m_is["sharpe"],
             "oos_ret":    oos_ret,
             "oos_ret_ann": m_oos["ret_ann"], "oos_vol": m_oos["vol_ann"],
             "oos_sharpe":  m_oos["sharpe"],  "oos_mdd": m_oos["mdd"],
         }
         print(f"  {name:<22s}  w=[{', '.join(f'{x:.1%}' for x in w)}]  "
-              f"IS Sharpe={s_is:.2f}  OOS Sharpe={m_oos['sharpe']:.2f}")
+              f"IS Sharpe(exces rf)={m_is['sharpe']:.2f}  OOS Sharpe(exces rf)={m_oos['sharpe']:.2f}")
 
     # ── Max Sharpe Rolling ────────────────────────────────────────────────────
     print("\n[4] Backtest rolling Max Sharpe (252j lookback, 63j rebal, equity floor 30%)...")
@@ -420,8 +447,8 @@ def main() -> None:
         rolling_method="max_sharpe",
         use_ledoit_wolf=False,
     )
-    m_roll_is = _perf_metrics(roll_ret_is)
-    m_roll = _perf_metrics(roll_ret)
+    m_roll_is = _perf_metrics(roll_ret_is, rf_is)
+    m_roll = _perf_metrics(roll_ret, rf_oos)
     strategies["Max Sharpe Rolling"] = {
         "ret_is":      m_roll_is["ret_ann"],
         "vol_is":      m_roll_is["vol_ann"],
@@ -431,7 +458,7 @@ def main() -> None:
         "oos_sharpe":  m_roll["sharpe"],  "oos_mdd": m_roll["mdd"],
     }
     print(f"  {'Max Sharpe Rolling':<22s}  (rolling)  "
-          f"IS Sharpe={m_roll_is['sharpe']:.2f}  OOS Sharpe={m_roll['sharpe']:.2f}")
+            f"IS Sharpe(exces rf)={m_roll_is['sharpe']:.2f}  OOS Sharpe(exces rf)={m_roll['sharpe']:.2f}")
 
     # ── Risk Parity + Tilt Rolling ────────────────────────────────────────────
     print("\n[4b] Backtest rolling Risk Parity + Tilt (Ledoit-Wolf, equity ceiling 60%)...")
@@ -457,8 +484,8 @@ def main() -> None:
         rolling_method="risk_parity_tilt",
         use_ledoit_wolf=cfg.use_ledoit_wolf,
     )
-    m_rp_tilt_is = _perf_metrics(rp_tilt_ret_is)
-    m_rp_tilt = _perf_metrics(rp_tilt_ret)
+    m_rp_tilt_is = _perf_metrics(rp_tilt_ret_is, rf_is)
+    m_rp_tilt = _perf_metrics(rp_tilt_ret, rf_oos)
     strategies["Risk Parity + Tilt"] = {
         "ret_is":      m_rp_tilt_is["ret_ann"],
         "vol_is":      m_rp_tilt_is["vol_ann"],
@@ -468,7 +495,7 @@ def main() -> None:
         "oos_sharpe":  m_rp_tilt["sharpe"],  "oos_mdd": m_rp_tilt["mdd"],
     }
     print(f"  {'Risk Parity + Tilt':<22s}  (rolling)  "
-          f"IS Sharpe={m_rp_tilt_is['sharpe']:.2f}  OOS Sharpe={m_rp_tilt['sharpe']:.2f}")
+            f"IS Sharpe(exces rf)={m_rp_tilt_is['sharpe']:.2f}  OOS Sharpe(exces rf)={m_rp_tilt['sharpe']:.2f}")
 
     # ── Tableau comparatif ────────────────────────────────────────────────────
     print("\n" + "=" * 60)
@@ -500,7 +527,7 @@ def main() -> None:
               f"{row['OOS_vol_ann']:>8.1%} {row['OOS_sharpe']:>7.2f} {row['OOS_mdd']:>8.1%}")
 
     best = comp_df["OOS_sharpe"].idxmax()
-    print(f"\n  ★  Meilleure stratégie OOS (Sharpe) : {best}")
+    print(f"\n  ★  Meilleure stratégie OOS (Sharpe exces rf) : {best}")
 
     # ── Export CSV ────────────────────────────────────────────────────────────
     comp_df.to_csv(cfg.out_csv)
@@ -508,7 +535,16 @@ def main() -> None:
 
     # ── Figures ───────────────────────────────────────────────────────────────
     print("\n[5] Génération des figures...")
-    _plot_frontier(s_rets, s_vols, s_sharpes, strategies, tickers, cfg.fig_dir, cfg.dpi)
+    _plot_frontier(
+        s_rets,
+        s_vols,
+        s_sharpes,
+        strategies,
+        tickers,
+        cfg.fig_dir,
+        cfg.dpi,
+        sharpe_label="Sharpe IS (exces rf Bund)",
+    )
     print(f"  -> {cfg.fig_dir / '06_efficient_frontier_core.png'}")
 
     _plot_oos_perf(strategies, cfg.fig_dir, cfg.dpi)

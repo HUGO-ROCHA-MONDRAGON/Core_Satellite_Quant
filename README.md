@@ -283,7 +283,7 @@ Le `warm_up_start = "2018-01-01"` dans `core_pipeline.py` atténue ce chevauchem
 | Max Drawdown | `min((cum / peak) - 1)` | Drawdown maximum sur la période |
 | Calmar | `ret_ann / |max_drawdown|` | Rendement sur risque de drawdown |
 
-**Note sur `rf = 0`** : le taux sans risque est fixé à zéro pour la construction du portefeuille. Ce choix est documenté et acceptable pour les décisions d'allocation (maximiser le Sharpe à rf=0 revient à maximiser le rapport rendement/volatilité). Pour un reporting client institutionnel, le rf devrait être paramétré (€STR ou OAT 10 ans).
+**Note sur le taux sans risque** : toutes les métriques Sharpe/alpha sont calculées en **excess-return** vs un proxy Bund 10 ans obtenu via `risk_free.py` (source FRED) avec fallback constant **2 % annualisé** si l'API est indisponible. Le proxy est aligné sur l'index des séries utilisées (IS et OOS) pour éviter toute incohérence de datation.
 
 ### Attribution (`attribution.py`)
 
@@ -304,36 +304,31 @@ r_portfolio(t) = alpha_daily + beta × r_core(t) + eps(t)
 Les modules sont organisés en **pipeline séquentiel** : Core → Satellite → Construction → Rapports.
 
 ```
-Core_Satellite_Quant/
-├── src/
-│   ├── core_pipeline.py          # Pipeline ETF Core : lecture, filtrage, sélection, backtest rolling
-│   ├── satellite_pipeline.py     # Pipeline Satellite v3 : shortlist, filtres IS, scoring, sélection
-│   ├── fond_construction.py      # Construction fonds final : allocation Core+Satellite, vol-targeting
-│   ├── portfolio_engine.py       # Moteur d'allocation : Risk Parity, vol-targeting, calibrer_allocation()
-│   ├── attribution.py            # Attribution alpha/beta rolling OLS (36 mois)
-│   ├── efficient_frontier_core.py # Frontière efficiente (outil d'analyse, non utilisé en production)
-│   ├── fees.py                   # Estimation des frais totaux (bps/an)
-│   └── plots_report.py           # Génération des 24 graphiques du rapport
+cross_asset/
 ├── data/
 │   ├── univers_core_etf_eur_daily_wide_VF.xlsx  # Prix + metadata ETFs Core (3 thèmes)
 │   ├── STRAT1_info.xlsx / STRAT1_price.xlsx     # Metadata + prix fonds Satellite Bloc 1
 │   ├── STRAT2_info.xlsx / STRAT2_price.xlsx     # idem Bloc 2
 │   └── STRAT3_info.xlsx / STRAT3_price.xlsx     # idem Bloc 3
-├── outputs/                      # Fichiers générés automatiquement par les pipelines
-│   ├── core_returns_daily_oos.csv
-│   ├── core_returns_daily_is.csv
+├── src/
+│   ├── risk_free.py                 # Proxy Bund 10Y + Sharpe excess
+│   ├── core_pipeline_corrected.py   # Pipeline ETF Core : lecture, filtrage, sélection, backtest rolling
+│   ├── satellite_pipeline_corrected.py # Pipeline Satellite : shortlist, filtres IS, scoring, sélection
+│   ├── fond_construction_corrected.py # Construction fonds final : allocation Core+Sat, vol-targeting
+│   ├── portfolio_engine.py          # Moteur d'allocation : Risk Parity, vol-targeting
+│   ├── efficient_frontier_core.py   # Frontière efficiente (outil d'analyse/diagnostic)
+│   ├── plots_report.py              # Rapport graphique complet (28 figures)
+│   ├── fees.py                      # Estimation des frais totaux (bps/an)
+│   └── attribution.py               # Attribution alpha/beta
+├── outputs/                         # Fichiers générés automatiquement par les pipelines
 │   ├── core_selected_etfs.csv
-│   ├── core3_etf_daily_log_returns.csv
-│   ├── satellite_selected.csv
-│   ├── satellite_selected_v3.csv
-│   ├── satellite_reserves.csv
-│   ├── fond_returns_daily.csv
-│   ├── fond_weights.csv
-│   ├── fond_metrics.csv
-│   └── fond_annual_perf.csv
-├── tests/
-│   └── sensitivity_analysis.py   # Analyse de sensibilité (grille w_sat, vol_target, etc.)
-├── main.ipynb                    # Notebook d'orchestration principal
+│   ├── core_returns_daily_is.csv / core_returns_daily_oos.csv
+│   ├── core3_etf_daily_log_returns.csv / core3_etf_daily_simple_returns.csv
+│   ├── satellite_selected.csv / satellite_selected_v3.csv / satellite_reserves.csv
+│   ├── fond_returns_daily.csv / fond_weights.csv / fond_metrics.csv / fond_annual_perf.csv
+│   └── figures/
+├── tests/                           # Scripts d’analyses complémentaires (benchmarks/sensitivité)
+├── main.ipynb                       # Notebook d'orchestration principal
 ├── requirements.txt
 └── README.md
 ```
@@ -379,10 +374,10 @@ source .venv/bin/activate  # Windows : .venv\Scripts\activate
 pip install -r requirements.txt
 
 # 4. Exécuter le pipeline complet (ordre recommandé)
-python src/core_pipeline.py        # Étape 1 : Sélection et backtest Core
-python src/satellite_pipeline.py   # Étape 2 : Sélection fonds Satellite
-python src/fond_construction.py    # Étape 3 : Construction fonds final
-python src/plots_report.py         # Étape 4 : Génération des graphiques
+python -m src.core_pipeline_corrected        # Étape 1 : Sélection et backtest Core
+python -m src.satellite_pipeline_corrected   # Étape 2 : Sélection fonds Satellite
+python -m src.fond_construction_corrected    # Étape 3 : Construction fonds final
+python -m src.plots_report                   # Étape 4 : Génération des graphiques
 
 # Ou via le notebook
 jupyter notebook main.ipynb

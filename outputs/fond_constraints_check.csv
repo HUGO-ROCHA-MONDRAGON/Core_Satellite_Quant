@@ -1,0 +1,8 @@
+constraint,value,min,max,ok
+Satellite <= 30%,0.03426853707414823,,0.3,True
+No leverage (gross <= 100%),1.0,,1.0,True
+Vol cible calib [8%;12%],0.11993658589423573,0.08,0.12,True
+Vol cible OOS [8%;12%],0.07985708523646469,0.08,0.12,False
+Frais total <= 80 bps,13.386435170664491,,80.0,True
+Core en EUR,1.0,,,True
+Satellite en EUR,1.0,,,True

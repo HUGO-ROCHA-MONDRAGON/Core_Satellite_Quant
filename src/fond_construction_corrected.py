@@ -30,6 +30,8 @@ try:
 except ImportError:
     from satellite_pipeline import lire_prix_wide  # type: ignore
 
+from risk_free import get_bund_risk_free_daily, sharpe_excess
+
 project_root = Path(__file__).resolve().parent.parent
 
 
@@ -43,12 +45,12 @@ class FondConfig:
     backtest_end: str = "2025-12-31"
 
     w_core_min: float = 0.70
-    w_core_max: float = 0.90
+    w_core_max: float = 1.00
     w_sat_abs_max: float = 0.30
 
     vol_target_min: float = 0.08
     vol_target_max: float = 0.12
-    vol_target_mid: float = 0.10
+    vol_target_mid: float = 0.12
     strict_vol_target: bool = False
 
     portfolio_scale: float = 1.00
@@ -66,7 +68,7 @@ class FondConfig:
     rebal_freq_days: int = 63
 
     # Modes possibles : "equal_weight" | "beta_inverse" | "score_prop" | "min_corr"
-    satellite_alloc_mode: str = "equal_weight"
+    satellite_alloc_mode: str = "beta_inverse"
 
     core_daily_csv: str = str(project_root / "outputs" / "core_returns_daily_oos.csv")
     core_daily_is_csv: str = str(project_root / "outputs" / "core_returns_daily_is.csv")
@@ -87,6 +89,7 @@ class FondConfig:
     output_returns_csv: str = str(project_root / "outputs" / "fond_returns_daily.csv")
     output_weights_csv: str = str(project_root / "outputs" / "fond_weights.csv")
     output_metrics_csv: str = str(project_root / "outputs" / "fond_metrics.csv")
+    output_constraints_csv: str = str(project_root / "outputs" / "fond_constraints_check.csv")
     output_beta_rolling_csv: str = str(project_root / "outputs" / "fond_beta_rolling.csv")
     output_annual_csv: str = str(project_root / "outputs" / "fond_annual_perf.csv")
 
@@ -469,14 +472,28 @@ def calibrer_allocation(
         w_s = 1.0 - w_c
         return np.sqrt(252.0 * (w_c**2 * vc + w_s**2 * vs + 2.0 * w_c * w_s * ccs))
 
-    candidates = np.linspace(cfg.w_core_min, cfg.w_core_max, 500)
+    w_core_low = max(cfg.w_core_min, 1.0 - cfg.w_sat_abs_max)
+    w_core_high = min(cfg.w_core_max, 1.0)
+    if w_core_low > w_core_high:
+        raise ValueError(
+            "Contraintes incohérentes: bornes Core incompatibles avec le cap satellite. "
+            f"w_core_low={w_core_low:.2%}, w_core_high={w_core_high:.2%}."
+        )
+
+    candidates = np.linspace(w_core_low, w_core_high, 500)
     vols = np.array([portfolio_vol(w) for w in candidates])
 
     feasible = (vols >= cfg.vol_target_min) & (vols <= cfg.vol_target_max)
     if feasible.any():
-        w_mid = (cfg.w_core_min + cfg.w_core_max) / 2.0
-        dists = np.abs(candidates[feasible] - w_mid)
-        w_opt = float(candidates[feasible][np.argmin(dists)])
+        # Choisir le poids qui vise au plus près la vol cible centrale,
+        # plutôt qu'un simple milieu de borne de poids.
+        cand_feas = candidates[feasible]
+        vol_feas = vols[feasible]
+        dists = np.abs(vol_feas - cfg.vol_target_mid)
+        min_dist = float(np.min(dists))
+        best = cand_feas[dists <= (min_dist + 1e-12)]
+        # Tie-break conservateur: privilégier le poids Core le plus élevé.
+        w_opt = float(np.max(best))
     else:
         if cfg.strict_vol_target:
             w_best = float(candidates[np.argmin(np.abs(vols - cfg.vol_target_mid))])
@@ -490,11 +507,88 @@ def calibrer_allocation(
         v_at_opt = portfolio_vol(w_opt)
         print(
             f"  ⚠  Vol cible [{cfg.vol_target_min:.0%}, {cfg.vol_target_max:.0%}] non atteignable "
-            f"dans w_core ∈ [{cfg.w_core_min:.0%}, {cfg.w_core_max:.0%}] → "
+            f"dans w_core ∈ [{w_core_low:.0%}, {w_core_high:.0%}] → "
             f"w_core = {w_opt:.1%}, vol ≈ {v_at_opt:.1%}"
         )
 
-    return w_opt, 1.0 - w_opt
+    w_sat = 1.0 - w_opt
+    if w_sat > cfg.w_sat_abs_max + 1e-12:
+        raise ValueError(
+            f"Contrainte satellite violée: w_sat={w_sat:.2%} > {cfg.w_sat_abs_max:.2%}."
+        )
+
+    return w_opt, w_sat
+
+
+def exporter_tableau_contraintes(
+    cfg: FondConfig,
+    metrics: Dict,
+    vol_calib: float,
+    core_currency_ok: bool,
+    sat_currency_ok: bool,
+) -> None:
+    """Exporte un tableau synthétique de conformité des contraintes mandat."""
+    w_core = float(metrics["w_core"])
+    w_sat = float(metrics["w_sat"])
+    total_exp = w_core + w_sat
+    vol_oos = float(metrics["vol_portfolio_ann"])
+    fees_bps = float(metrics["fees_total_bps"])
+
+    rows = [
+        {
+            "constraint": "Satellite <= 30%",
+            "value": w_sat,
+            "min": np.nan,
+            "max": cfg.w_sat_abs_max,
+            "ok": w_sat <= cfg.w_sat_abs_max + 1e-12,
+        },
+        {
+            "constraint": "No leverage (gross <= 100%)",
+            "value": total_exp,
+            "min": np.nan,
+            "max": 1.0,
+            "ok": total_exp <= 1.0 + 1e-12,
+        },
+        {
+            "constraint": "Vol cible calib [8%;12%]",
+            "value": vol_calib,
+            "min": cfg.vol_target_min,
+            "max": cfg.vol_target_max,
+            "ok": cfg.vol_target_min <= vol_calib <= cfg.vol_target_max,
+        },
+        {
+            "constraint": "Vol cible OOS [8%;12%]",
+            "value": vol_oos,
+            "min": cfg.vol_target_min,
+            "max": cfg.vol_target_max,
+            "ok": cfg.vol_target_min <= vol_oos <= cfg.vol_target_max,
+        },
+        {
+            "constraint": "Frais total <= 80 bps",
+            "value": fees_bps,
+            "min": np.nan,
+            "max": cfg.fees_bps_max,
+            "ok": fees_bps <= cfg.fees_bps_max + 1e-12,
+        },
+        {
+            "constraint": "Core en EUR",
+            "value": float(core_currency_ok),
+            "min": np.nan,
+            "max": np.nan,
+            "ok": core_currency_ok,
+        },
+        {
+            "constraint": "Satellite en EUR",
+            "value": float(sat_currency_ok),
+            "min": np.nan,
+            "max": np.nan,
+            "ok": sat_currency_ok,
+        },
+    ]
+
+    out = pd.DataFrame(rows)
+    out.to_csv(cfg.output_constraints_csv, index=False)
+    print(f"  -> {cfg.output_constraints_csv}")
 
 
 def backtest(
@@ -589,6 +683,8 @@ def calculer_metriques(
     w_sat: float,
     core_fees_bps: float,
     cfg: FondConfig,
+    rf_daily: pd.Series,
+    rf_source: str,
 ) -> Dict:
     """Calcul complet des métriques sur la période de backtest."""
     r_p = bt_df["portfolio_ret"]
@@ -603,8 +699,13 @@ def calculer_metriques(
     ann_c = float((1.0 + r_c).prod() ** (252.0 / len(r_c)) - 1.0)
     ann_s = float((1.0 + r_s).prod() ** (252.0 / len(r_s)) - 1.0)
 
-    sharpe_p = ann_p / vol_p if vol_p > 1e-6 else np.nan
-    sharpe_c = ann_c / vol_c if vol_c > 1e-6 else np.nan
+    rf_bt = rf_daily.reindex(bt_df.index).ffill().fillna(0.0)
+    sharpe_p = sharpe_excess(r_p, rf_bt)
+    sharpe_c = sharpe_excess(r_c, rf_bt)
+    sharpe_s = sharpe_excess(r_s, rf_bt)
+    excess_p_ann = float((r_p - rf_bt).mean() * 252.0)
+    excess_c_ann = float((r_c - rf_bt).mean() * 252.0)
+    excess_s_ann = float((r_s - rf_bt).mean() * 252.0)
 
     alpha_p_daily, beta_p = _ols(r_p.values, r_c.values)
     alpha_p_ann = float((1.0 + alpha_p_daily) ** 252 - 1.0)
@@ -636,15 +737,19 @@ def calculer_metriques(
     return {
         "vol_portfolio_ann": vol_p,
         "ret_ann_portfolio": ann_p,
+        "ret_ann_excess_portfolio": excess_p_ann,
         "sharpe_portfolio": sharpe_p,
         "max_drawdown": mdd,
         "alpha_portfolio_ann": alpha_p_ann,
         "beta_portfolio": beta_p,
         "vol_core_ann": vol_c,
         "ret_ann_core": ann_c,
+        "ret_ann_excess_core": excess_c_ann,
         "sharpe_core": sharpe_c,
         "vol_satellite_ann": vol_s,
         "ret_ann_satellite": ann_s,
+        "ret_ann_excess_satellite": excess_s_ann,
+        "sharpe_satellite": sharpe_s,
         "alpha_satellite_ann": alpha_s_ann,
         "beta_satellite_static": beta_s_static,
         "beta_sat_rolling_mean": beta_sat_roll_mean,
@@ -657,6 +762,7 @@ def calculer_metriques(
         "fees_sat_contrib_bps": w_sat * fees_sat_wavg,
         "fees_total_bps": fees_total_bps,
         "fees_ok": fees_total_bps <= cfg.fees_bps_max,
+        "rf_source": rf_source,
         "_annual_df": annual_df,
         "_beta_rolling_series": rb,
     }
@@ -678,6 +784,17 @@ def main() -> None:
 
     sat_info = pd.read_csv(cfg.satellite_selected_csv)
     tickers_sat = sat_info["ticker"].astype(str).tolist()
+
+    sat_currency_ok = True
+    if "devise" in sat_info.columns:
+        sat_currency_ok = sat_info["devise"].astype(str).str.lower().eq("euro").all()
+
+    core_currency_ok = True
+    core_finaux_path = project_root / "outputs" / "Core_finaux.csv"
+    if core_finaux_path.exists():
+        core_finaux = pd.read_csv(core_finaux_path)
+        if "devise" in core_finaux.columns:
+            core_currency_ok = core_finaux["devise"].astype(str).str.upper().eq("EUR").all()
 
     scores_is: pd.Series | None = None
     v3_path = Path(cfg.satellite_selected_v3_csv)
@@ -786,6 +903,15 @@ def main() -> None:
     w_core_eff = w_core
     w_sat_eff = w_sat
 
+    if w_sat_eff > cfg.w_sat_abs_max + 1e-12:
+        raise ValueError(
+            f"Contrainte satellite violée après calibration: {w_sat_eff:.2%} > {cfg.w_sat_abs_max:.2%}"
+        )
+    if (w_core_eff + w_sat_eff) > 1.0 + 1e-12:
+        raise ValueError(
+            f"Contrainte sans levier violée: exposition totale={w_core_eff + w_sat_eff:.2%}"
+        )
+
     print(f"  Exposition brute      Core {w_core_eff:.1%} | Satellite {w_sat_eff:.1%} | Total {w_core_eff + w_sat_eff:.1%}  (pas de levier)")
     print(f"  Vol calib : {vol_total_calib:.1%}")
 
@@ -803,8 +929,21 @@ def main() -> None:
     bt_df = backtest(core_rets, sat_prices, sat_weights, w_core_eff, w_sat_eff, cfg)
     print(f"  {len(bt_df)} observations | {bt_df.index.min().date()} → {bt_df.index.max().date()}")
 
+    rf_daily, rf_source = get_bund_risk_free_daily(bt_df.index)
+    print(f"  Taux sans risque (Bund proxy): {rf_source}")
+
     print("\n[6] Calcul des métriques de performance...")
-    metrics = calculer_metriques(bt_df, sat_weights, fees_bps, w_core_eff, w_sat_eff, core_fees_bps, cfg)
+    metrics = calculer_metriques(
+        bt_df,
+        sat_weights,
+        fees_bps,
+        w_core_eff,
+        w_sat_eff,
+        core_fees_bps,
+        cfg,
+        rf_daily,
+        rf_source,
+    )
 
     print("\n" + "=" * 65)
     print("  RÉSULTATS – BACKTEST 2021-2025")
@@ -818,7 +957,7 @@ def main() -> None:
         f"(cible [{cfg.vol_target_min:.0%}, {cfg.vol_target_max:.0%}])  "
         f"{'✓' if cfg.vol_target_min <= metrics['vol_portfolio_ann'] <= cfg.vol_target_max else '⚠'}"
     )
-    print(f"    Sharpe               {metrics['sharpe_portfolio']:.3f}")
+    print(f"    Sharpe (exces rf)    {metrics['sharpe_portfolio']:.3f}")
     print(f"    Max Drawdown         {metrics['max_drawdown']:.2%}")
 
     print("\n  ALPHA / BETA vs CORE")
@@ -828,11 +967,12 @@ def main() -> None:
     print("\n  POCHE CORE")
     print(f"    Rendement annualisé  {metrics['ret_ann_core']:+.2%}")
     print(f"    Volatilité           {metrics['vol_core_ann']:.2%}")
-    print(f"    Sharpe               {metrics['sharpe_core']:.3f}")
+    print(f"    Sharpe (exces rf)    {metrics['sharpe_core']:.3f}")
 
     print("\n  POCHE SATELLITE")
     print(f"    Rendement annualisé  {metrics['ret_ann_satellite']:+.2%}")
     print(f"    Volatilité           {metrics['vol_satellite_ann']:.2%}")
+    print(f"    Sharpe (exces rf)    {metrics['sharpe_satellite']:.3f}")
     print(f"    Alpha vs Core (ann.) {metrics['alpha_satellite_ann']:+.2%}")
     print(f"    Beta statique        {metrics['beta_satellite_static']:+.3f}")
     print(f"    Beta rolling 3M – μ  {metrics['beta_sat_rolling_mean']:+.3f}  (cible ≈ 0)")
@@ -889,6 +1029,15 @@ def main() -> None:
 
     metrics["_beta_rolling_series"].to_frame().to_csv(cfg.output_beta_rolling_csv)
     print(f"  -> {cfg.output_beta_rolling_csv}")
+
+    print("\n[8] Export contrôle de conformité...")
+    exporter_tableau_contraintes(
+        cfg=cfg,
+        metrics=metrics,
+        vol_calib=float(vol_total_calib),
+        core_currency_ok=bool(core_currency_ok),
+        sat_currency_ok=bool(sat_currency_ok),
+    )
 
     print("\n  ✓  Fonds Core-Satellite construit avec succès.")
 

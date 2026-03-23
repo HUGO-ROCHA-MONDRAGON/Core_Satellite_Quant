@@ -26,6 +26,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from src.risk_free import get_bund_risk_free_daily, sharpe_excess
+
 
 SCORE_WEIGHTS: Dict[str, float] = {
     "neg_abs_beta": 0.30,
@@ -489,12 +491,16 @@ def _annualized_vol(daily_rets: pd.Series) -> float:
     return float(daily_rets.std() * np.sqrt(252))
 
 
-def _annualized_sharpe(daily_rets: pd.Series) -> float:
-    """Sharpe annualisé avec taux sans risque nul."""
-    vol = _annualized_vol(daily_rets)
-    if vol < 1e-10:
-        return np.nan
-    return _annualized_return(daily_rets) / vol
+def _annualized_sharpe(daily_rets: pd.Series, rf_daily: pd.Series | None = None) -> float:
+    """Sharpe annualisé (exces rf si rf_daily est fourni)."""
+    if rf_daily is None:
+        vol = _annualized_vol(daily_rets)
+        if vol < 1e-10:
+            return np.nan
+        return _annualized_return(daily_rets) / vol
+
+    rf_aligned = rf_daily.reindex(daily_rets.index).ffill().fillna(0.0)
+    return sharpe_excess(daily_rets, rf_aligned)
 
 
 def _max_drawdown(daily_rets: pd.Series) -> float:
@@ -521,11 +527,13 @@ def calculer_metriques_calib(
     core_rets: pd.Series,
     calib_start: str,
     calib_end: str,
+    rf_daily: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Calcule les métriques IS 2019-2020 pour chaque fonds satellite."""
     fund_rets = _price_to_simple_returns(wide_prices).dropna(how="all")
     rets_calib = fund_rets.loc[calib_start:calib_end]
     core_calib = core_rets.loc[calib_start:calib_end]
+    rf_calib = rf_daily.loc[calib_start:calib_end] if rf_daily is not None else None
 
     if core_calib.empty:
         raise ValueError("La série Core est vide sur la fenêtre de calibration 2019-2020.")
@@ -575,7 +583,7 @@ def calculer_metriques_calib(
             {
                 "ticker": ticker,
                 "vol_calib": _annualized_vol(s),
-                "sharpe_calib": _annualized_sharpe(s),
+                "sharpe_calib": _annualized_sharpe(s, rf_calib),
                 "sortino_calib": sortino,
                 "alpha_annual": alpha,
                 "beta_core": beta,
@@ -936,6 +944,7 @@ def traiter_bloc(
     all_info: pd.DataFrame,
     core_rets: pd.Series,
     core_eqw_rets: pd.Series,
+    rf_daily: pd.Series,
     cfg: SatelliteConfig,
 ) -> Tuple[List[str], pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
     """Traite un bloc complet : shortlist, filtres, score, sélection, réserves."""
@@ -1007,7 +1016,13 @@ def traiter_bloc(
         return [], pd.DataFrame(), info, pd.DataFrame(), []
 
     prices = prices[t_beta]
-    metrics = calculer_metriques_calib(prices, core_rets, cfg.calib_start, cfg.calib_end)
+    metrics = calculer_metriques_calib(
+        prices,
+        core_rets,
+        cfg.calib_start,
+        cfg.calib_end,
+        rf_daily=rf_daily,
+    )
     print(f"             {len(metrics)} fonds avec données suffisantes")
 
     t0 = filtrer_niveau0(info, prices, cfg)
@@ -1206,6 +1221,9 @@ def main(cfg: SatelliteConfig | None = None) -> None:
         f"{core_eqw_rets.index.min().date()} → {core_eqw_rets.index.max().date()}"
     )
 
+    rf_daily, rf_source = get_bund_risk_free_daily(core_rets.index)
+    print(f"    Risk-free Bund : {rf_source}")
+
     all_selected: Dict[str, List[str]] = {}
     all_reserves: Dict[str, List[str]] = {}
     all_info_bloc: Dict[str, pd.DataFrame] = {}
@@ -1221,6 +1239,7 @@ def main(cfg: SatelliteConfig | None = None) -> None:
             all_info,
             core_rets,
             core_eqw_rets,
+            rf_daily,
             cfg,
         )
         all_selected[bloc_name] = sel
