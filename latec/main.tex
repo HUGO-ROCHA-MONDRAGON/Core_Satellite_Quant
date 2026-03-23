@@ -624,8 +624,20 @@ Cette lecture annuelle est utile car elle nuance fortement l’interprétation d
 
 \begin{figure}[ht]
     \centering
+    \includegraphics[width=0.9\textwidth]{D03_portfolio_annual.png}
+    \caption{Performance annuelle : Portefeuille vs Core.}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
     \includegraphics[width=0.9\textwidth]{D04_portfolio_vol_target.png}
     \caption{Volatilité rolling 63 jours du portefeuille vs bande cible 8--12\%.}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\textwidth]{D05_beta_sat_rolling.png}
+    \caption{Bêta rolling 63 jours de la Satellite vs Core ($|\beta| \leq 0{,}25$).}
 \end{figure}
 
 \begin{figure}[ht]
@@ -700,5 +712,62 @@ Le principal enseignement de cette figure est que la corrélation n’est pas co
 Cette variabilité n’invalide toutefois pas la logique de construction retenue. En pratique, une poche satellite n’a pas besoin d’être en permanence dans une zone de corrélation strictement nulle ou négative pour être utile. Il suffit qu’elle présente, en moyenne, une sensibilité limitée au Core et qu’elle améliore effectivement le profil rendement/risque du portefeuille global. C’est précisément ce que montrent nos autres résultats : le bêta de la poche satellite reste modéré, la corrélation moyenne demeure contenue, et l’introduction du satellite améliore à la fois le Sharpe global et le drawdown.
 
 Ainsi, cette figure doit être interprétée comme un indicateur de réalisme méthodologique : la décorrélation existe, mais elle n’est ni parfaite ni immuable. Notre conclusion n’est donc pas que la poche satellite est systématiquement indépendante du Core, mais qu’elle apporte une diversification suffisamment robuste pour justifier son intégration au portefeuille.
+
+\section{Décomposition synthétique de la performance}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\textwidth]{C01_core_vs_sat_cum.png}
+    \caption{Performance cumulée : Core vs Satellite vs Portefeuille total.}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\textwidth]{C02_excess_cum.png}
+    \caption{Excès de performance cumulée du portefeuille vs Core.}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\textwidth]{C04_annual_grouped_bar.png}
+    \caption{Décomposition annuelle : Core vs Portefeuille vs Satellite.}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.9\textwidth]{C05_excess_annual.png}
+    \caption{Excès de performance annuel du portefeuille vs Core.}
+\end{figure}
+
+Lecture rapide : la Satellite amortit 2022 (choc actions/taux), le portefeuille surperforme alors le Core en relatif, mais reste en léger déficit cumulatif faute de levier et d’un Satellite très prudent. Les contributions annuelles confirment ce profil : meilleure résilience en stress, moindre capture des rallys actions. Couplé à la vol sous-cible (section D04) et au bêta contenu (section D05), cette décomposition plaide pour une V2 avec Satellite un peu plus risquée ou un poids Core/Sat plus flexible.
+
+\section{Diagnostics vol/bêta et attribution par composant}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.95\textwidth]{Z02_vol_rolling_composants.png}
+    \caption{Volatilité rolling 63j annualisée : portefeuille, poches et composantes Core/Satellite.}
+\end{figure}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.95\textwidth]{Z01_perf_composants.png}
+    \caption{Performance cumulée par composant (Satellite et Core) avec risk-free (fallback 2\%).}
+\end{figure}
+
+\paragraph{Commentaire concis}
+\begin{itemize}
+    \item Volatilité : la poche Satellite reste autour de 2--3\% annuels, tire la vol du portefeuille sous la borne 8\% hors pics 2025 ; Core domine la volatilité réalisée.
+    \item Bêta : les composantes Satellite restent en bêta faible/oscillant autour de 0 (cf. figure D05), cohérent avec la logique de décorrélation first.
+    \item Attribution : côté Satellite, DWMAEIA et LUMNUDE portent la majorité de la perf excédentaire vs rf ; côté Core, XDWD domine tandis que EUNH/XBLC restent sous le rf (fallback).
+    \item Lecture rf : le rf est plat à 2\% (fallback FRED); remplacer par la courbe Bund réelle affinera les excès sans changer les positions relatives.
+\end{itemize}
+
+\paragraph{Note sur rf et sous-performances vs rf}
+\begin{itemize}
+    \item \textbf{Taux sans risque linéaire} : la série rf est plate car l’appel API Bund (FRED) a échoué ; fallback constant \textbf{2\% annualisé} utilisé (cf. risk\_free.py). Avec l’API ou une série locale Bund, on obtient une courbe quotidienne 10Y.
+    \item \textbf{Fonds Satellite sous rf} : PDAIEUR, EXCRISA, AEABSIA. Conservés pour leur bêta/corrélation très bas (décorrélation first). Action possible : passer en réserve si un remplaçant garde $\beta \approx 0$ avec excès $>\,$rf.
+    \item \textbf{Core sous rf} : EUNH et XBLC affichent un excès négatif/marginal mais jouent le rôle défensif/rate. Si l’objectif est rendement $>$ rf strict, revoir la sélection Core ou plafonner ces lignes ; sinon on les garde pour diversification et maîtrise de la vol.
+\end{itemize}
 
 \end{document}
