@@ -509,6 +509,50 @@ def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
     plt.close()
 
 
+def _weights_selection_dataframe(
+    strategies: Dict,
+    tickers: List[str],
+    output_csv: Path | None = None,
+) -> pd.DataFrame:
+    """
+    Crée un DataFrame avec les poids de chaque stratégie.
+    
+    Paramètres:
+    -----------
+    strategies : Dict
+        Dictionnaire {"strategy_name": {"w": array, ...}, ...}
+    tickers : List[str]
+        Noms des assets (XDWD, EUNH, XBLC, ...)
+    output_csv : Path | None
+        Chemin pour exporter le CSV des poids (optionnel)
+    
+    Retour:
+    -------
+    pd.DataFrame
+        Index: noms des stratégies
+        Colonnes: tickers avec poids en pourcentage
+    """
+    data = {}
+    for name, d in strategies.items():
+        w = d.get("w")
+        if w is not None:
+            data[name] = w
+    
+    weights_df = pd.DataFrame(
+        data,
+        index=tickers
+    ).T
+    
+    # Formater en pourcentage
+    weights_df = weights_df.multiply(100).round(2)
+    weights_df = weights_df.applymap(lambda x: f"{x:.2f}%")
+    
+    if output_csv:
+        weights_df.to_csv(output_csv)
+    
+    return weights_df
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Main
 # ══════════════════════════════════════════════════════════════════════════════
@@ -620,6 +664,14 @@ def main() -> Tuple[Dict, pd.DataFrame]:
     # ── Export CSV ────────────────────────────────────────────────────────────
     comp_df.to_csv(cfg.out_csv)
     print(f"\n  -> {cfg.out_csv}")
+
+    # ── Export des poids de sélection ─────────────────────────────────────────
+    weights_df = _weights_selection_dataframe(strategies, tickers)
+    weights_csv = cfg.project_root / "outputs" / "core_weights_selection.csv"
+    weights_df.to_csv(weights_csv)
+    print(f"\n[4] Dataframe de sélection des poids :")
+    print(weights_df.to_string())
+    print(f"\n  -> {weights_csv}")
 
     # ── Figures ───────────────────────────────────────────────────────────────
     print("\n[5] Génération des figures...")

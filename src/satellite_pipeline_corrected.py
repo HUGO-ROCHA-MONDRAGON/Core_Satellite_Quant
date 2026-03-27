@@ -129,11 +129,11 @@ class SatelliteConfig:
     allowed_currencies: List[str] = field(default_factory=lambda: ["Euro"])
     excluded_strategies: List[str] = field(default_factory=list)
 
-    beta_rolling_days: int = 252
-    beta_filter_window_days: int = 63
-    beta_filter_max_abs: float = 0.45
-    beta_filter_min_pass_ratio: float = 0.70
-    beta_filter_q75_max: float = 0.65
+    beta_rolling_days: int = 126
+    beta_filter_window_days: int = 126
+    beta_filter_max_abs: float = 0.20
+    beta_filter_min_pass_ratio: float = 0.95
+    beta_filter_q75_max: float = 0.30
 
     stale_max_ratio: float = 0.10
     stale_max_ratio_by_ticker: Dict[str, float] = field(

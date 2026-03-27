@@ -115,7 +115,7 @@ def _drawdown(returns: pd.Series) -> pd.Series:
     return wealth / wealth.cummax() - 1.0
 
 
-def _roll_vol(returns: pd.Series, window: int = 63) -> pd.Series:
+def _roll_vol(returns: pd.Series, window: int = 126) -> pd.Series:
     """Volatilité rolling annualisée."""
     return returns.rolling(window).std() * np.sqrt(252)
 
@@ -123,7 +123,7 @@ def _roll_vol(returns: pd.Series, window: int = 63) -> pd.Series:
 def _roll_sharpe(
     returns: pd.Series,
     rf_daily: pd.Series | None = None,
-    window: int = 63,
+    window: int = 126,
 ) -> pd.Series:
     """Sharpe rolling annualisé (exces rf si fourni)."""
     if rf_daily is None:
@@ -140,7 +140,7 @@ def _roll_sharpe(
 def _roll_alpha_beta(
     y: pd.Series,
     x: pd.Series,
-    window: int = 63,
+    window: int = 126,
 ) -> tuple[pd.Series, pd.Series]:
     """Calcule alpha et bêta rolling."""
     cov_ = y.rolling(window).cov(x)
@@ -298,7 +298,7 @@ def plot_A04_core_rolling_vol(r_core: pd.Series, cfg: PlotConfig) -> None:
     fig, ax = plt.subplots(figsize=(10, 4))
     _roll_vol(r_core).mul(100).plot(ax=ax, color="#e6194b")
     ax.yaxis.set_major_formatter(mtick.PercentFormatter())
-    ax.set_title("A04 – Volatilité rolling 63j du Core (annualisée)")
+    ax.set_title("A04 – Volatilité rolling 126j du Core (annualisée)")
     ax.set_xlabel("Date")
     ax.set_ylabel("Vol annualisée (%)")
     _save(cfg.fig_dir, "A04_core_rolling_vol.png", cfg.dpi)
@@ -313,7 +313,7 @@ def plot_A05_core_rolling_sharpe(
     fig, ax = plt.subplots(figsize=(10, 4))
     _roll_sharpe(r_core, rf_daily=rf_daily).plot(ax=ax, color="#e6194b")
     ax.axhline(0, color="black", lw=0.8, ls="--")
-    ax.set_title("A05 – Sharpe rolling 63j du Core (exces rf Bund)")
+    ax.set_title("A05 – Sharpe rolling 126j du Core (exces rf Bund)")
     ax.set_xlabel("Date")
     ax.set_ylabel("Sharpe (exces rf)")
     _save(cfg.fig_dir, "A05_core_rolling_sharpe.png", cfg.dpi)
@@ -489,13 +489,13 @@ def plot_B04_sat_rolling_alpha(
     cfg: PlotConfig,
 ) -> None:
     """B04 – Alpha rolling de la poche satellite."""
-    alpha_roll, _ = _roll_alpha_beta(r_sat, r_core, window=63)
+    alpha_roll, _ = _roll_alpha_beta(r_sat, r_core, window=126)
 
     fig, ax = plt.subplots(figsize=(10, 4))
     alpha_roll.mul(100).plot(ax=ax, color="#3cb44b")
     ax.axhline(0, color="black", lw=0.8, ls="--")
     ax.yaxis.set_major_formatter(mtick.PercentFormatter())
-    ax.set_title("B04 – Alpha rolling 63j de la poche satellite vs Core")
+    ax.set_title("B04 – Alpha rolling 126j de la poche satellite vs Core")
     ax.set_xlabel("Date")
     ax.set_ylabel("Alpha annualisé (%)")
     _save(cfg.fig_dir, "B04_sat_rolling_alpha.png", cfg.dpi)
@@ -509,7 +509,7 @@ def plot_B05_sat_rolling_beta(beta_roll: pd.Series, cfg: PlotConfig) -> None:
     ax.axhline(cfg.beta_target_abs, color="orange", lw=1, ls=":", label="+β max")
     ax.axhline(-cfg.beta_target_abs, color="orange", lw=1, ls=":", label="-β max")
     ax.fill_between(beta_roll.index, beta_roll, 0, alpha=0.15, color="#4363d8")
-    ax.set_title("B05 – Beta rolling 63j de la poche satellite vs Core")
+    ax.set_title("B05 – Beta rolling 126j de la poche satellite vs Core")
     ax.set_xlabel("Date")
     ax.set_ylabel("Beta")
     ax.legend(fontsize=9)
@@ -786,7 +786,7 @@ def plot_D04_portfolio_vol_target(r_port: pd.Series, cfg: PlotConfig) -> None:
     roll_vol = _roll_vol(r_port).mul(100)
 
     fig, ax = plt.subplots(figsize=(10, 4))
-    roll_vol.plot(ax=ax, color="#4363d8", lw=1.5, label="Vol rolling 63j")
+    roll_vol.plot(ax=ax, color="#4363d8", lw=1.5, label="Vol rolling 126j")
     ax.axhline(
         cfg.vol_target_min * 100,
         color="orange",
@@ -810,7 +810,7 @@ def plot_D04_portfolio_vol_target(r_port: pd.Series, cfg: PlotConfig) -> None:
     )
 
     ax.yaxis.set_major_formatter(mtick.PercentFormatter())
-    ax.set_title("D04 – Volatilité rolling 63j vs bande cible")
+    ax.set_title("D04 – Volatilité rolling 126j vs bande cible")
     ax.set_xlabel("Date")
     ax.set_ylabel("Vol annualisée (%)")
     ax.legend(fontsize=9)
@@ -820,7 +820,7 @@ def plot_D04_portfolio_vol_target(r_port: pd.Series, cfg: PlotConfig) -> None:
 def plot_D05_beta_sat_rolling(beta_roll: pd.Series, cfg: PlotConfig) -> None:
     """D05 – Bêta rolling satellite vs Core."""
     fig, ax = plt.subplots(figsize=(10, 4))
-    beta_roll.plot(ax=ax, color="#4363d8", lw=1.5, label="Beta rolling 63j")
+    beta_roll.plot(ax=ax, color="#4363d8", lw=1.5, label="Beta rolling 126j")
     ax.axhline(0, color="black", lw=0.8, ls="--")
     ax.axhline(
         cfg.beta_target_abs,
@@ -839,7 +839,7 @@ def plot_D05_beta_sat_rolling(beta_roll: pd.Series, cfg: PlotConfig) -> None:
         label=f"Zone cible |β| ≤ {cfg.beta_target_abs:.2f}",
     )
 
-    ax.set_title("D05 – Beta rolling 63j de la poche satellite vs Core")
+    ax.set_title("D05 – Beta rolling 126j de la poche satellite vs Core")
     ax.set_xlabel("Date")
     ax.set_ylabel("Beta")
     ax.legend(fontsize=9)

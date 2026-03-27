@@ -629,7 +629,7 @@ def backtest(
     cfg: FondConfig,
 ) -> pd.DataFrame:
     """
-    Backtest journalier buy-and-hold entre les rebalancements (tous les ~63j).
+    Backtest journalier buy-and-hold entre les rebalancements (tous les ~126j).
     Poche Core    : utilise directement core_rets (Max-Sharpe rolling de core_pipeline).
     Poche Satellite: poids θ fixes, remis en place chaque trimestre.
     Retourne DataFrame ['core_ret', 'sat_pocket_ret', 'portfolio_ret'].
@@ -715,11 +715,11 @@ def _ols(y: np.ndarray, x: np.ndarray) -> Tuple[float, float]:
     return float(b[0]), float(b[1])
 
 
-def beta_rolling(y: pd.Series, x: pd.Series, window: int = 63) -> pd.Series:
-    """Rolling OLS beta de y sur x (fenêtre par défaut = 63j ≈ 3 mois)."""
+def beta_rolling(y: pd.Series, x: pd.Series, window: int = 126) -> pd.Series:
+    """Rolling OLS beta de y sur x (fenêtre par défaut = 126j ≈ 6 mois)."""
     cov_ = y.rolling(window).cov(x)
     var_ = x.rolling(window).var()
-    return (cov_ / var_).rename("beta_rolling_63j")
+    return (cov_ / var_).rename("beta_rolling_126j")
 
 
 def _yearly_perf(r: pd.Series) -> pd.Series:
@@ -772,8 +772,8 @@ def calculer_metriques(
     peak       = cum_wealth.cummax()
     mdd        = float(((cum_wealth / peak) - 1.0).min())
 
-    # ── Beta rolling 63j de la poche satellite vs Core ────────────────────────
-    rb = beta_rolling(r_s, r_c, window=63)
+    # ── Beta rolling 126j de la poche satellite vs Core ───────────────────────
+    rb = beta_rolling(r_s, r_c, window=126)
     beta_sat_roll_mean = float(rb.dropna().mean())
     beta_sat_roll_std  = float(rb.dropna().std())
 

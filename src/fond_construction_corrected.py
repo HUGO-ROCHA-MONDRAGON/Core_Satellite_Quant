@@ -660,11 +660,11 @@ def backtest(
     )
 
 
-def beta_rolling(y: pd.Series, x: pd.Series, window: int = 63) -> pd.Series:
+def beta_rolling(y: pd.Series, x: pd.Series, window: int = 126) -> pd.Series:
     """Rolling OLS beta de y sur x."""
     cov_ = y.rolling(window).cov(x)
     var_ = x.rolling(window).var()
-    return (cov_ / var_).rename("beta_rolling_63j")
+    return (cov_ / var_).rename("beta_rolling_126j")
 
 
 def _yearly_perf(r: pd.Series) -> pd.Series:
@@ -717,7 +717,7 @@ def calculer_metriques(
     peak = cum_wealth.cummax()
     mdd = float(((cum_wealth / peak) - 1.0).min())
 
-    rb = beta_rolling(r_s, r_c, window=63)
+    rb = beta_rolling(r_s, r_c, window=126)
     beta_sat_roll_mean = float(rb.dropna().mean())
     beta_sat_roll_std = float(rb.dropna().std())
 
@@ -975,8 +975,8 @@ def main() -> None:
     print(f"    Sharpe (exces rf)    {metrics['sharpe_satellite']:.3f}")
     print(f"    Alpha vs Core (ann.) {metrics['alpha_satellite_ann']:+.2%}")
     print(f"    Beta statique        {metrics['beta_satellite_static']:+.3f}")
-    print(f"    Beta rolling 3M – μ  {metrics['beta_sat_rolling_mean']:+.3f}  (cible ≈ 0)")
-    print(f"    Beta rolling 3M – σ  {metrics['beta_sat_rolling_std']:.3f}  (stabilité : plus faible = mieux)")
+    print(f"    Beta rolling 6M – μ  {metrics['beta_sat_rolling_mean']:+.3f}  (cible ≈ 0)")
+    print(f"    Beta rolling 6M – σ  {metrics['beta_sat_rolling_std']:.3f}  (stabilité : plus faible = mieux)")
 
     corr_oos = float(bt_df["core_ret"].corr(bt_df["sat_pocket_ret"]))
     print("\n  DÉCORRÉLATION STRUCTURELLE (OOS)")

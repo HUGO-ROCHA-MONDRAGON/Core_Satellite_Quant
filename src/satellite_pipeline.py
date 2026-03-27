@@ -168,13 +168,13 @@ class SatelliteConfig:
     excluded_strategies: List[str] = field(default_factory=list)
 
     # ── Rolling beta window ───────────────────────────────────────────────
-    beta_rolling_days: int = 252
+    beta_rolling_days: int = 126
 
     # ── Filtre beta initial (vs core équipondéré des 3 ETF sélectionnés) ─
-    beta_filter_window_days: int = 63
-    beta_filter_max_abs: float = 0.35
-    beta_filter_min_pass_ratio: float = 0.80
-    beta_filter_q75_max: float = 0.55
+    beta_filter_window_days: int = 126
+    beta_filter_max_abs: float = 0.20
+    beta_filter_min_pass_ratio: float = 0.95
+    beta_filter_q75_max: float = 0.30
 
     # ── Qualité de cotation (stale pricing) ─────────────────────────────
     stale_max_ratio: float = 0.10
