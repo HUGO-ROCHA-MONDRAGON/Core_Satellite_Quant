@@ -1,0 +1,5 @@
+quarter_date,Strat,ticker,rank_in_strat,score_level2,selected_reason,pair_corr,score_gap_vs_top1,active_review_date,switch_flag,switch_reason
+2025-10-01 00:00:00,STRAT1,ALLVOSI LX Equity,1,0.9833337239663908,top1,,0.0,2024-01-01 00:00:00,0,hold_buffer
+2025-10-01 00:00:00,STRAT2,SCHCTEA LX Equity,1,1.7056756360204886,top1,,0.0,2024-01-01 00:00:00,0,hold_buffer
+2025-10-01 00:00:00,STRAT2,CARTMTE LX Equity,2,1.2378802708496548,top2_diversified,0.012916357495822454,0.09096074852922742,2023-01-02 00:00:00,0,hold_buffer
+2025-10-01 00:00:00,STRAT3,NUMCAII ID Equity,1,1.9533341633611152,top1,,0.0,2025-01-01 00:00:00,0,hold_buffer

@@ -468,8 +468,7 @@ def _plot_frontier(
     ax.set_title("Frontière efficiente – 3 ETF Core\n(calibration 2019-2020, daily)")
     ax.legend(fontsize=8)
     plt.tight_layout()
-    plt.savefig(fig_dir / "06_efficient_frontier_core.png", dpi=dpi)
-    plt.close()
+    return fig
 
 
 def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
@@ -505,8 +504,7 @@ def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
     ax2.grid(axis="y", alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(fig_dir / "07_core_strategies_oos_perf.png", dpi=dpi)
-    plt.close()
+    return fig
 
 
 def _weights_selection_dataframe(
@@ -661,21 +659,14 @@ def main() -> Tuple[Dict, pd.DataFrame]:
     best = comp_df["OOS_sharpe"].idxmax()
     print(f"\n  ★  Meilleure stratégie OOS (Sharpe exces rf) : {best}")
 
-    # ── Export CSV ────────────────────────────────────────────────────────────
-    comp_df.to_csv(cfg.out_csv)
-    print(f"\n  -> {cfg.out_csv}")
-
-    # ── Export des poids de sélection ─────────────────────────────────────────
+    # ── Poids de sélection ─────────────────────────────────────────────────
     weights_df = _weights_selection_dataframe(strategies, tickers)
-    weights_csv = cfg.project_root / "outputs" / "core_weights_selection.csv"
-    weights_df.to_csv(weights_csv)
     print(f"\n[4] Dataframe de sélection des poids :")
     print(weights_df.to_string())
-    print(f"\n  -> {weights_csv}")
 
     # ── Figures ───────────────────────────────────────────────────────────────
     print("\n[5] Génération des figures...")
-    _plot_frontier(
+    fig_frontier = _plot_frontier(
         s_rets,
         s_vols,
         s_sharpes,
@@ -686,13 +677,10 @@ def main() -> Tuple[Dict, pd.DataFrame]:
         cfg.dpi,
         sharpe_label="Sharpe IS (exces rf Bund)",
     )
-    print(f"  -> {cfg.fig_dir / '06_efficient_frontier_core.png'}")
-
-    _plot_oos_perf(strategies, cfg.fig_dir, cfg.dpi)
-    print(f"  -> {cfg.fig_dir / '07_core_strategies_oos_perf.png'}")
+    fig_oos = _plot_oos_perf(strategies, cfg.fig_dir, cfg.dpi)
 
     print("\n  ✓  Frontière efficiente terminée.")
-    return strategies, comp_df
+    return strategies, comp_df, fig_frontier, fig_oos
 
 
 if __name__ == "__main__":

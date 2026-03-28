@@ -605,8 +605,8 @@ def _print_inter_etf_correlations(
                 print(f"    {name_i} vs {name_j} : {corr.iloc[i, j]:.3f}")
 
 
-def main() -> None:
-    """Exécute le pipeline Core complet."""
+def main() -> dict:
+    """Exécute le pipeline Core complet. Retourne les DataFrames clés."""
     cfg = CoreConfig()
 
     if not cfg.core_excel.exists():
@@ -653,40 +653,10 @@ def main() -> None:
     metas = {"Equity": meta_eq, "Rates": meta_rt, "Credit": meta_cr}
     selected_df = _collect_selected_metadata(selected_map, metas)
 
-    output_core_finaux = cfg.output_dir / cfg.output_core_finaux_csv_name
-    output_selected_core = cfg.output_dir / cfg.output_selected_core_csv_name
-    output_core_finaux.parent.mkdir(parents=True, exist_ok=True)
-
-    # Fichier riche pour documentation / présentation
-    selected_df.to_csv(output_core_finaux, index=False)
-
-    # Fichier technique pour le reste du pipeline
-    selected_core_export = pd.DataFrame(
-        {
-            "core_etfs": [
-                selected_map["Equity"],
-                selected_map["Rates"],
-                selected_map["Credit"],
-            ],
-            "theme": ["Equity", "Rates", "Credit"],
-        }
-    )
-    selected_core_export.to_csv(output_selected_core, index=False)
-
-    print(f"  -> {output_core_finaux}")
-    print(f"  -> {output_selected_core}")
-
     print("\n[4/6] Construction des séries des 3 ETF Core...")
     wide_core = _build_selected_prices(selected_map, wide_eq, wide_rt, wide_cr, cfg)
     core_3_log = np.log(wide_core).diff().dropna()
     core_3_simple = _log_to_simple(core_3_log)
-
-    output_core3_log = cfg.output_dir / cfg.output_core3_log_csv_name
-    output_core3_simple = cfg.output_dir / cfg.output_core3_simple_csv_name
-    _export_dataframe(core_3_log, output_core3_log)
-    _export_dataframe(core_3_simple, output_core3_simple)
-    print(f"  -> {output_core3_log}")
-    print(f"  -> {output_core3_simple}")
 
     print("\n[5/6] Backtest rolling du portefeuille Core...")
     core_log_is, weights_is = backtest_rolling(
@@ -710,27 +680,6 @@ def main() -> None:
     core_simple_is = _log_to_simple(core_log_is)
     core_simple_oos = _log_to_simple(core_log_oos)
 
-    output_is = cfg.output_dir / cfg.output_core_daily_is_csv_name
-    output_oos = cfg.output_dir / cfg.output_core_daily_csv_name
-    output_is_log = cfg.output_dir / cfg.output_core_daily_is_log_csv_name
-    output_oos_log = cfg.output_dir / cfg.output_core_daily_log_csv_name
-    output_weights_is = cfg.output_dir / cfg.output_weights_is_csv_name
-    output_weights_oos = cfg.output_dir / cfg.output_weights_oos_csv_name
-
-    _export_series(core_simple_is.rename("core_return_is"), output_is)
-    _export_series(core_simple_oos.rename("core_return_oos"), output_oos)
-    _export_series(core_log_is.rename("core_log_return_is"), output_is_log)
-    _export_series(core_log_oos.rename("core_log_return_oos"), output_oos_log)
-    _export_dataframe(weights_is, output_weights_is)
-    _export_dataframe(weights_oos, output_weights_oos)
-
-    print(f"  -> {output_is}")
-    print(f"  -> {output_oos}")
-    print(f"  -> {output_is_log}")
-    print(f"  -> {output_oos_log}")
-    print(f"  -> {output_weights_is}")
-    print(f"  -> {output_weights_oos}")
-
     print("\n[6/6] Corrélations inter-ETF...")
     _print_inter_etf_correlations(core_3_log, cfg.score_start, cfg.score_end, "IS")
     _print_inter_etf_correlations(core_3_log, cfg.oos_start, cfg.oos_end, "OOS")
@@ -740,8 +689,13 @@ def main() -> None:
     for theme, ticker in selected_map.items():
         print(f"  {theme:10s}: {ticker}")
     print(f"  Budget max frais Core : {cfg.max_core_expense_pct:.2f}%")
-    print(f"  Fichier OOS principal : {output_oos.name} (simple returns)")
     print("=" * 68)
+
+    return {
+        "core_finaux": selected_df,
+        "core_3_log": core_3_log,
+        "core_3_simple": core_3_simple,
+    }
 
 
 if __name__ == "__main__":
