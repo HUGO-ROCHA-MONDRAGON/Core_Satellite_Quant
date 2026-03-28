@@ -203,15 +203,18 @@ def lire_theme(
     theme_name: str,
     sheet_prices: str,
     sheet_meta: str,
+    verbose: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Lit les prix et metadata d'un thème."""
-    print(f"  Lecture {theme_name}...")
+    if verbose:
+        print(f"  Lecture {theme_name}...")
     wide = _lire_wide_values(cfg.core_excel, sheet_prices)
     meta = _lire_metadata(cfg.core_excel, sheet_meta)
-    print(
-        f"    -> {wide.shape[1]} ETFs | "
-        f"{wide.index.min().date()} à {wide.index.max().date()}"
-    )
+    if verbose:
+        print(
+            f"    -> {wide.shape[1]} ETFs | "
+            f"{wide.index.min().date()} à {wide.index.max().date()}"
+        )
     return wide, meta
 
 
@@ -583,6 +586,49 @@ def _build_selected_prices(
         selected_map["Credit"],
     ]
     return prices
+
+
+def load_selected_core_log_returns(
+    cfg: CoreConfig | None = None,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """Reconstruit les log-rendements des 3 ETF Core depuis l'Excel source."""
+    cfg = cfg or CoreConfig()
+
+    if not cfg.core_excel.exists():
+        raise FileNotFoundError(f"Fichier introuvable : {cfg.core_excel}")
+
+    wide_eq, meta_eq = lire_theme(
+        cfg,
+        "Equity",
+        cfg.sheet_equity_prices,
+        cfg.sheet_equity_meta,
+        verbose=verbose,
+    )
+    wide_rt, meta_rt = lire_theme(
+        cfg,
+        "Rates",
+        cfg.sheet_rates_prices,
+        cfg.sheet_rates_meta,
+        verbose=verbose,
+    )
+    wide_cr, meta_cr = lire_theme(
+        cfg,
+        "Credit",
+        cfg.sheet_credit_prices,
+        cfg.sheet_credit_meta,
+        verbose=verbose,
+    )
+
+    selected_map = cfg.selected_core_map
+    _validate_selected_ticker("Equity", selected_map["Equity"], wide_eq, meta_eq, cfg)
+    _validate_selected_ticker("Rates", selected_map["Rates"], wide_rt, meta_rt, cfg)
+    _validate_selected_ticker("Credit", selected_map["Credit"], wide_cr, meta_cr, cfg)
+
+    wide_core = _build_selected_prices(selected_map, wide_eq, wide_rt, wide_cr, cfg)
+    core_3_log = np.log(wide_core).diff().dropna()
+    core_3_log.index = pd.DatetimeIndex(core_3_log.index).tz_localize(None)
+    return core_3_log
 
 
 def _print_inter_etf_correlations(

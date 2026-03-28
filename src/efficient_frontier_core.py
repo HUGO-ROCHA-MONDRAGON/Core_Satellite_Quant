@@ -2,7 +2,7 @@
 Comparaison des stratégies Core via frontière efficiente (données daily).
 
 Entrée :
-- outputs/core3_etf_daily_log_returns.csv  (log-rendements journaliers des 3 ETF)
+- data/univers_core_etf_eur_daily_wide.xlsx via src.core_pipeline_corrected.load_selected_core_log_returns
 
 Fenêtre IS  : 2019-01-01 → 2020-12-31  (calibration, sans look-ahead)
 Fenêtre OOS : 2021-01-01 → 2025-12-31  (évaluation)
@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from scipy.optimize import minimize
 
+from src.core_pipeline_corrected import load_selected_core_log_returns
 from src.risk_free import get_bund_risk_free_daily
 
 project_root = Path(__file__).resolve().parent.parent
@@ -40,7 +41,7 @@ project_root = Path(__file__).resolve().parent.parent
 @dataclass(frozen=True)
 class FrontierConfig:
     project_root: Path = Path(__file__).resolve().parent.parent
-    input_csv:    Path = project_root / "outputs" / "core3_etf_daily_log_returns.csv"
+    source_excel: Path = project_root / "data" / "univers_core_etf_eur_daily_wide.xlsx"
     fig_dir:      Path = project_root / "outputs" / "figures"
     out_csv:      Path = project_root / "outputs" / "core_portfolio_comparison.csv"
 
@@ -566,12 +567,12 @@ def main() -> Tuple[Dict, pd.DataFrame]:
     print("=" * 60)
 
     # ── Chargement ────────────────────────────────────────────────────────────
-    print("\n[1] Chargement des log-rendements journaliers des 3 ETF...")
-    df = pd.read_csv(cfg.input_csv, index_col=0, parse_dates=True)
-    df.index = pd.DatetimeIndex(df.index).tz_localize(None)
+    print("\n[1] Chargement des log-rendements journaliers des 3 ETF depuis l'Excel source...")
+    df = load_selected_core_log_returns(verbose=False)
     df = df.sort_index()
     tickers = list(df.columns)
     print(f"  ETFs : {tickers}")
+    print(f"  Source : {cfg.source_excel.name}")
     print(f"  Période : {df.index.min().date()} → {df.index.max().date()}")
 
     rf_daily_all, rf_source = get_bund_risk_free_daily(df.index)
