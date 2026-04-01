@@ -1,12 +1,11 @@
 """
-Satellite Data Loader & Preprocessor
-Charge les données (prix + info), filtre sur 2019-2020, aligne les dates correctement
+Satellite Data Loader — chargement prix, prétraitement et alignement avec le Core.
 """
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Tuple
 
 
 def load_satellite_prices_wide(price_file: str) -> pd.DataFrame:
@@ -171,106 +170,3 @@ def align_prices_with_core(
     print(f"   Tickers: {df_aligned.shape[1]}")
     
     return df_aligned, core_aligned
-
-
-def get_satellite_prices_in_period(
-    ticker: str,
-    df_prices: pd.DataFrame,
-    start_date: str = "2019-01-01",
-    end_date: str = "2020-12-31"
-) -> pd.Series:
-    """
-    Récupère les prix d'un fonds pour une période donnée.
-    """
-    if ticker not in df_prices.columns:
-        return pd.Series([], dtype=float)
-    
-    prices = df_prices.loc[start_date:end_date, ticker].copy()
-    prices = prices.dropna()
-    
-    return prices
-
-
-def get_satellite_returns_aligned(
-    ticker: str,
-    df_prices: pd.DataFrame,
-    core_returns: pd.Series,
-    ffill_limit: int = 5
-) -> Tuple[pd.Series, pd.Series]:
-    """
-    Récupère les rendements log d'un fonds, alignés avec le Core.
-    """
-    if ticker not in df_prices.columns:
-        return pd.Series([], dtype=float), pd.Series([], dtype=float)
-    
-    prices = df_prices[ticker].copy()
-    
-    # FFill limité
-    prices_ffilled = prices.fillna(method='ffill', limit=ffill_limit)
-    
-    # Rendements
-    returns_fund = np.log(prices_ffilled / prices_ffilled.shift(1)).dropna()
-    
-    # Aligner avec le Core
-    common_index = returns_fund.index.intersection(core_returns.index)
-    
-    returns_fund_aligned = returns_fund.loc[common_index]
-    core_returns_aligned = core_returns.loc[common_index]
-    
-    return returns_fund_aligned, core_returns_aligned
-
-
-def load_and_preprocess(
-    data_dir: str = "data",
-    core_returns_file: str = "outputs/core3_etf_daily_log_returns.csv",
-    start_date: str = "2019-01-01",
-    end_date: str = "2020-12-31",
-    verbose: bool = True
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, list]:
-    """
-    Pipeline complet de chargement et prétraitement.
-    
-    Retourne:
-    - df_prices: tous les prix
-    - df_returns: rendements journaliers
-    - core_returns: rendements du Core équipondéré
-    - valid_tickers: liste des tickers valides
-    """
-    
-    print("\n" + "="*80)
-    print("SATELLITE DATA LOADER & PREPROCESSOR")
-    print("="*80)
-    
-    # 1. Charger les prix
-    df_prices = load_all_satellite_prices(data_dir)
-    
-    # 2. Charger les rendements du Core
-    try:
-        core_returns_raw = pd.read_csv(core_returns_file, index_col=0, parse_dates=True)
-        core_returns = core_returns_raw.iloc[:, 0].dropna()
-    except FileNotFoundError:
-        print(f"\n❌ Fichier Core {core_returns_file} non trouvé")
-        return None
-    
-    # 3. Prétraiter les prix (filtrer dates, ffill)
-    df_prices_clean, valid_tickers = preprocess_prices(
-        df_prices,
-        start_date=start_date,
-        end_date=end_date,
-        ffill_limit=5,
-        min_obs=50
-    )
-    
-    # 4. Calculer les rendements
-    df_returns = calculate_daily_returns(df_prices_clean)
-    
-    # 5. Aligner avec le Core
-    df_aligned, core_aligned = align_prices_with_core(
-        df_prices_clean,
-        core_returns,
-        ffill_limit=5
-    )
-    
-    print(f"\n✅ Pipeline complet terminé")
-    
-    return df_aligned, df_returns, core_aligned, valid_tickers

@@ -1,475 +1,666 @@
-# Core-Satellite Quant — Fonds Quantitatif EUR
+# Core-Satellite Quant — Logique Financière de Construction du Portefeuille
 
-> Moteur de construction et de backtest d'un fonds Core-Satellite institutionnel,
-> entièrement codé en Python, avec séparation stricte In-Sample / Out-of-Sample.
+> Document de référence décrivant **toute la logique financière** du fonds Core-Satellite EUR.
+> Ce document ne contient aucune référence au code — il se concentre uniquement sur les choix
+> d'investissement, les méthodologies quantitatives et les paramètres retenus.
+
+---
 
 ## Table des matières
-1. [Vision du projet](#1-vision-du-projet)
-2. [Philosophie d'investissement Core-Satellite](#2-philosophie-dinvestissement-core-satellite)
-3. [Architecture de la poche Core](#3-architecture-de-la-poche-core)
-4. [Sélection qualitative et quantitative des fonds Satellite](#4-sélection-qualitative-et-quantitative-des-fonds-satellite)
-5. [Moteur de portefeuille et vol-targeting](#5-moteur-de-portefeuille-et-vol-targeting)
-6. [Fenêtres temporelles — Choix IS/OOS et justification](#6-fenêtres-temporelles--choix-isoos-et-justification)
-7. [Métriques et attribution de performance](#7-métriques-et-attribution-de-performance)
-8. [Architecture technique du code](#8-architecture-technique-du-code)
-9. [Installation et exécution](#9-installation-et-exécution)
-10. [Structure des fichiers](#10-structure-des-fichiers)
-11. [Notes méthodologiques importantes (anti-biais)](#11-notes-méthodologiques-importantes-anti-biais)
-12. [Limites connues et pistes d'amélioration](#12-limites-connues-et-pistes-damélioration)
+
+1. [Vue d'ensemble du fonds](#1-vue-densemble-du-fonds)
+2. [Fenêtres temporelles IS / OOS](#2-fenêtres-temporelles-is--oos)
+3. [Poche Core — Sélection des ETFs](#3-poche-core--sélection-des-etfs)
+4. [Poche Core — Frontière efficiente et choix de la stratégie](#4-poche-core--frontière-efficiente-et-choix-de-la-stratégie)
+5. [Poche Core — Simulation et rebalancement](#5-poche-core--simulation-et-rebalancement)
+6. [Détection du régime de marché](#6-détection-du-régime-de-marché)
+7. [Poche Satellite — Filtre structurel (Level 0)](#7-poche-satellite--filtre-structurel-level-0)
+8. [Poche Satellite — Filtre beta rolling (Level 1)](#8-poche-satellite--filtre-beta-rolling-level-1)
+9. [Poche Satellite — Scoring alpha + frais (Level 2)](#9-poche-satellite--scoring-alpha--frais-level-2)
+10. [Poche Satellite — Scoring personnalisé par bloc](#10-poche-satellite--scoring-personnalisé-par-bloc)
+11. [Poche Satellite — Sélection annuelle et trimestrielle glissante](#11-poche-satellite--sélection-annuelle-et-trimestrielle-glissante)
+12. [Allocation dynamique intra-Satellite par régime](#12-allocation-dynamique-intra-satellite-par-régime)
+13. [Performance Satellite et contributions par bloc](#13-performance-satellite-et-contributions-par-bloc)
+14. [Comparaison Core vs Satellite](#14-comparaison-core-vs-satellite)
+15. [Frais Satellite](#15-frais-satellite)
+16. [Allocation dynamique Core / Satellite (vol-targeting)](#16-allocation-dynamique-core--satellite-vol-targeting)
+17. [Portefeuille final — Dashboard et métriques](#17-portefeuille-final--dashboard-et-métriques)
+18. [Garde-fous anti look-ahead bias](#18-garde-fous-anti-look-ahead-bias)
 
 ---
 
-## 1. Vision du projet
+## 1. Vue d'ensemble du fonds
 
-Ce projet implémente un **fonds Core-Satellite institutionnel en EUR**, dont le but est de combiner deux sources de rendement complémentaires :
+Ce fonds suit une **architecture Core-Satellite** :
 
-- **La poche Core (70–75 %)** : exposition bêta bon marché via des ETFs cotés en EUR couvrant les grandes classes d'actifs (actions européennes, taux, crédit). L'objectif est de capter les primes de risque de long terme à faible coût de gestion.
-- **La poche Satellite (25–30 %)** : génération d'alpha décorrélé du marché via des fonds alternatifs sélectionnés rigoureusement (CTA, market neutral, event driven, crédit structuré). L'objectif est un bêta satellite ≈ 0 et un alpha positif indépendant du cycle.
+- **Poche Core (70–75 %)** : exposition aux primes de risque de long terme via 3 ETFs cotés en EUR couvrant les grandes classes d'actifs (actions mondiales, obligations souveraines, crédit). Objectif : bêta de marché à faible coût.
+- **Poche Satellite (25–30 %)** : génération d'alpha décorrélé du marché via des fonds alternatifs sélectionnés rigoureusement (CTA, market neutral, event driven, crédit structuré). Objectif : bêta ≈ 0 vis-à-vis du Core, alpha positif indépendant du cycle.
 
-**Cibles de gestion :**
+L'allocation entre Core et Satellite est **dynamique** : chaque mois, le poids Satellite est recalculé pour cibler une volatilité globale du portefeuille de **10 % annualisée**, avec une bande morte (deadband) de ±0,5 %.
 
-| Paramètre | Cible |
-|-----------|-------|
-| Volatilité annualisée totale | 8–12 % |
-| Frais totaux estimés | ≤ 80 bps/an |
-| Bêta poche Satellite vs Core | ≈ 0 (objectif décorrélation-first) |
-| Univers investissable Core | ETFs EUR cotés uniquement |
-| Univers investissable Satellite | Fonds alternatifs domiciliés EUR |
-
-Le code est **entièrement en Python**, structuré en pipelines modulaires avec une **séparation stricte In-Sample (IS) / Out-of-Sample (OOS)** : aucune décision de construction ou de calibration ne consulte de données postérieures à la date de décision (janvier 2021).
-
----
-
-## 2. Philosophie d'investissement Core-Satellite
-
-### La poche Core : stabilité et coût minimal
-
-La poche Core représente **70–75 % du portefeuille**. Elle est construite autour de 3 ETFs EUR thématiques (Equity, Rates, Credit), sélectionnés parmi un univers filtré sur leur qualité structurelle (ancienneté, liquidité, TER). Les poids Core sont recalibrés chaque trimestre par Risk Parity avec tilt momentum Equity, sans jamais utiliser d'estimateur de rendement attendu (robustesse OOS).
-
-### La poche Satellite : alpha décorrélé en 3 blocs
-
-La poche Satellite représente **25–30 % du portefeuille** et est organisée en 3 blocs fonctionnels :
-
-| Poche | % du portefeuille | Objectif | Instruments |
-|-------|-------------------|----------|-------------|
-| Core | 70–75 % | Bêta de marché peu coûteux | 3 ETFs EUR (Equity, Rates, Credit) |
-| Satellite Bloc 1 | ~7–8 % | Décorrélation / Convexité | CTA Trend, Short Volatilité |
-| Satellite Bloc 2 | ~10–12 % | Alpha Décorrélé | Event Driven, Merger Arb, L/S, Market Neutral |
-| Satellite Bloc 3 | ~7–8 % | Carry / Crédit Structuré | ABS, CLO, FI Relative Value, Senior Loans |
-
-**Le principe directeur est la décorrélation-first** : le critère n°1 pour chaque fonds satellite est un bêta rolling proche de zéro vis-à-vis du Core. Le rendement et le Sharpe ne sont des critères qu'en second lieu. Cette approche garantit que la poche Satellite ajoute réellement de la diversification au portefeuille, sans dupliquer le risque de la poche Core.
+| Paramètre | Valeur |
+|-----------|--------|
+| Volatilité cible totale | 10 % annualisé |
+| Poids Satellite | 25 % – 30 % du portefeuille |
+| Poids Core | 70 % – 75 % du portefeuille |
+| Devise | EUR |
+| Période de calibration (IS) | 2019-01-01 → 2020-12-31 |
+| Période de validation (OOS) | 2021-01-01 → 2025-12-31 |
 
 ---
 
-## 3. Architecture de la poche Core
+## 2. Fenêtres temporelles IS / OOS
 
-### Univers des ETFs
+| Fenêtre | Dates | Rôle |
+|---------|-------|------|
+| **In-Sample (IS)** | 01/01/2019 → 31/12/2020 | Calibration de tous les paramètres : poids Core via frontière efficiente, seuils de filtrage Satellite, seuils de régime |
+| **Out-of-Sample (OOS)** | 01/01/2021 → 31/12/2025 | Application des règles calibrées, sans aucune recalibration. Évaluation de la performance réelle |
 
-Le fichier `univers_core_etf_eur_daily_wide_VF.xlsx` contient les prix quotidiens et les métadonnées de l'univers des ETFs Core, organisés en 3 onglets thématiques (Equity, Rates, Credit). Chaque onglet contient :
-- Les prix en format *wide* (dates en lignes, tickers Bloomberg en colonnes)
-- Les métadonnées (TER, date de lancement, exposition géographique)
+### Pourquoi 2019–2020 comme IS ?
 
-### Filtres structurels
+Cette fenêtre est dite *"through-the-cycle"* car elle couvre :
+- **2019** : marché haussier, faible volatilité
+- **T1 2020** : crash COVID (−35 % en 5 semaines), contaminant toutes les classes d'actifs
 
-Avant la sélection, chaque ETF est soumis à des filtres structurels :
-
-| Filtre | Valeur | Justification |
-|--------|--------|---------------|
-| Date de lancement | ≤ 2019-01-01 | Track record ≥ 2 ans avant OOS |
-| Fréquence de cotation | ≤ 2 jours ouvrés de gap moyen | Liquidité acceptable |
-| Budget TER | ≤ 80 bps/an (global) | Maîtrise des frais |
-| Exposition Equity | Mots-clés "Europe" | Fonds EUR institutionnel |
-
-### Sélection `pick_best_theme()`
-
-Pour chaque thème (Equity, Rates, Credit), la fonction `pick_best_theme()` sélectionne le **meilleur ETF selon le Sharpe annualisé sur la fenêtre IS 2019-2020**. Cette fenêtre est dite *"through-the-cycle IS"* car elle inclut à la fois un régime haussier (2019) et le crash COVID (mars 2020).
-
-### Optimisation rolling `risk_parity_tilt`
-
-Les poids Core sont recalibrés chaque trimestre (63 jours ouvrés) par la méthode `risk_parity_tilt` :
-
-1. **Risk Parity de base** : `w_i ∝ 1/σ_i` (inverse de la volatilité de chaque ETF sur le lookback de 252 jours)
-2. **Tilt Equity dynamique** : si le momentum Equity sur 252 jours est positif, le poids Equity est porté au plafond (`equity_weight_ceiling = 60 %`). Sinon, il est limité au plancher (`equity_weight_floor = 30 %`).
-3. **Covariance Ledoit-Wolf** : la matrice de covariance est estimée par shrinkage de Ledoit-Wolf (via scikit-learn) pour réduire l'erreur d'estimation.
-
-**Paramètres clés :**
-
-| Paramètre | Valeur | Rôle |
-|-----------|--------|------|
-| `lookback` | 252 jours | Fenêtre d'estimation de la covariance |
-| `rebal_freq` | 63 jours | Fréquence de rebalancement (trimestrielle) |
-| `equity_weight_floor` | 30 % | Poids minimum Equity |
-| `equity_weight_ceiling` | 60 % | Poids maximum Equity (régime haussier) |
-| `momentum_window` | 252 jours | Fenêtre du momentum Equity |
-| `use_ledoit_wolf` | True | Shrinkage Ledoit-Wolf sur la covariance |
-
-**Pourquoi Risk Parity plutôt que Max Sharpe ?**
-
-Le Max Sharpe dépend de l'estimateur de rendement attendu μ, qui est très bruyant sur des fenêtres courtes. En OOS, cela génère des poids instables et une performance dégradée. Le Risk Parity ne dépend que des volatilités et corrélations — des quantités plus stables — et offre une robustesse OOS supérieure documentée par la littérature académique.
+Tout ETF ou fonds retenu sur cette fenêtre a donc été testé dans deux régimes opposés. Cela réduit considérablement le risque de sélection sur un unique régime favorable.
 
 ---
 
-## 4. Sélection qualitative et quantitative des fonds Satellite
+## 3. Poche Core — Sélection des ETFs
 
-### 4.1 Philosophie de sélection
+### Univers d'ETFs
 
-La sélection des fonds Satellite repose sur une **approche en deux temps** :
+L'univers de départ est constitué d'ETFs cotés en EUR, organisés en **3 thèmes** (blocs) :
+- **Equity** : ETFs actions mondiales / européennes
+- **Rates** : ETFs obligations souveraines
+- **Credit** : ETFs obligations d'entreprises (investment grade)
 
-1. **Pré-sélection qualitative** : une *shortlist* de 19 fonds est constituée manuellement, sur la base de critères qualitatifs (réputation du gérant, stratégie clairement définie, décorrélation prouvée en période de stress, domiciliation EUR). Cette shortlist réduit l'univers de recherche et évite les biais de data mining sur un univers trop large.
+### Filtres structurels pré-sélection
 
-2. **Filtrage quantitatif** : les 19 fonds de la shortlist sont ensuite soumis à un pipeline de filtres quantitatifs calculés **exclusivement sur la fenêtre IS 2019-2020**.
+Avant d'entrer dans l'optimisation, chaque ETF doit satisfaire :
 
-**Critère de track record :** chaque fonds doit avoir un premier prix ≤ 01/01/2019. Cela garantit que tous les fonds de la shortlist ont traversé le crash COVID (mars 2020) dans leur track record IS, ce qui est un test de résistance implicite.
+| Filtre | Critère | Justification |
+|--------|---------|---------------|
+| Date de lancement | ≤ 01/01/2019 | Au moins 2 ans de track record avant la période OOS |
+| Cotation | Pas de gap majeur | Liquidité correcte |
 
-### 4.2 Les 3 blocs Satellite
+### ETFs Core retenus
 
-#### Bloc 1 — Décorrélation / Convexité (~7–8 % du portefeuille)
+Pour chaque thème, **un seul ETF** est retenu — celui ayant le meilleur ratio rendement/risque sur l'IS. Les 3 ETFs retenus sont :
 
-Objectif : fonds qui performent ou tiennent en période de stress de marché. Le bêta est épisodique mais la médiane est proche de zéro. Ces fonds apportent de la **convexité** au portefeuille : ils tendent à bien performer précisément quand le Core souffre.
-
-| Ticker Bloomberg | Nom / Gérant | Stratégie | Justification qualitative |
-|---|---|---|---|
-| DWMAEIA ID Equity | Dunn Capital — WMA EUR Acc | CTA Trend Following | Un des plus anciens CTA en activité (depuis 1984). Stratégie purement systématique sur futures diversifiés. Décorrélation prouvée en période de stress (2008, COVID). Convexité naturelle : le trend-following capte les grandes tendances de crise. |
-| FINVPRI GR Equity | FinCam — Short Volatility EUR | Short Volatilité (prime de variance) | Capture la prime de variance (VIX vs vol réalisée) de façon systématique. Décorrélé du marché directionnel en régime normal. Risque de queue (short gamma) géré par un budget strict. Complément naturel du CTA en régime de faible vol. |
-
-#### Bloc 2 — Alpha Décorrélé (~10–12 % du portefeuille)
-
-Objectif : alpha pur, bêta market proche de zéro, Sharpe régulier indépendant du cycle.
-
-| Ticker Bloomberg | Nom / Gérant | Stratégie | Justification qualitative |
-|---|---|---|---|
-| HFHPERC LX Equity | Syquant Capital — Helium Fund | Event Driven | Spécialiste de l'arbitrage d'événements corporate (M&A, spin-offs, restructurations) en Europe. Track record > 10 ans, Sharpe > 1 historiquement. Alpha purement idiosyncratique, non corrélé aux marchés directionnels. |
-| EXCRISA LX Equity | Exane — Merger Arbitrage | Merger Arbitrage | Stratégie pure merger arb sur opérations annoncées. Spread capture avec risque de deal break géré. Corrélation quasi nulle avec les marchés equity et taux. Liquidité correcte (hebdomadaire). |
-| PDAIEUR LX Equity | Pictet — Diversified Alpha | Multi-Stratégie Market Neutral | Multi-strat market neutral de Pictet AM. Diversification interne entre sub-strategies (stat arb, pairs trading, vol trading). Bêta structurellement proche de zéro par construction. |
-| HSMSTIC LX Equity | HSBC — Multi-Strategy | Multi-Stratégie | Multi-strat diversifiée sur un univers large. Allocation dynamique entre stratégies selon le régime de marché. AUM important garantissant la stabilité opérationnelle. |
-| REYLSEB LX Equity | RAM Active Investments — Lux Systematic Equity | Market Neutral | Market neutral systématique de RAM. Modèle quantitatif factoriel (value, momentum, quality) avec hedging bêta dynamique. Sharpe régulier, drawdowns contenus. |
-| CARPPFE LX Equity | Carmignac Portfolio — Long-Short EU | Long/Short Europe | L/S actions européennes de Carmignac. Exposition nette faible (±20 %). Alpha stock-picking + hedging macro. Bien établi dans l'univers des fonds alternatifs EUR. |
-| ELEARER LX Equity | Eleva Capital — Eleva Abs. Ret. Europe | Long/Short Europe | Boutique L/S EU de haute conviction. Équipe issue de Lehman/Rothschild. Processus fondamental rigoureux. Corrélation faible au marché grâce à la flexibilité de l'exposition nette. |
-| LDAPB2E ID Equity | Dalton Investments — Pan Asia Long Short | Long/Short Asie | L/S Asie de Dalton, apportant une diversification géographique au portefeuille. Marché asiatique peu corrélé aux cycles européens. Expertise locale reconnue. |
-| LUMNUDE LX Equity | Man GLG — Absolute Return | Market Neutral Man GLG | Market neutral systématique de Man GLG. Infrastructure quantitative de premier plan. Stratégie de statistique arb pur. |
-| EXCERFD LX Equity | Exane — Ceres Fund | Long/Short Value Europe | L/S value Europe avec approche fondamentale. Complément à ELEARER (approche différente). Diversification du stock-picking intra-bloc 2. |
-
-#### Bloc 3 — Carry / Crédit Structuré (~7–8 % du portefeuille)
-
-Objectif : capture de primes de crédit et de liquidité, faible corrélation actions et taux directionnels.
-
-| Ticker Bloomberg | Nom / Gérant | Stratégie | Justification qualitative |
-|---|---|---|---|
-| AEABSIA ID Equity | Aegon — ABS Senior | ABS Senior | Fonds ABS senior tranches investment grade. Carry régulier avec faible duration. Risque de crédit structuré diversifié (RMBS, auto, consumer). Décorrélé des équités. |
-| BNPAOPP LX Equity | BNP Paribas — Asset-Backed Securities | ABS Diversifié | ABS diversifié sur plusieurs pays EUR. Complémentaire à Aegon (gérant et exposition géographique différents). Liquidité mensuelle, valorisation transparente. |
-| CLOHQIA GR Equity | Lupus Alpha — CLO Senior | CLO Senior | Spécialiste CLO senior AAA-AA de Lupus Alpha. Carry CLO significatif vs taux sans risque. Risque de défaut corporate diversifié sur 200+ prêts. Cotation moins fréquente (tolérance stale ratio élargie documentée dans le code). |
-| INICLBI GR Equity | Infinigon — CLO IG | CLO Investment Grade | CLO IG de Infinigon. Exposition complémentaire à Lupus Alpha. Rating IG moyen, carry supérieur aux corporate bonds classiques. |
-| DISFCPE LX Equity | Danske Invest — FI Relative Value | Fixed Income Relative Value | FI Relative Value de Danske. Capture des spreads intra-marchés taux (swap spreads, basis trades). Décorrélé du marché directionnel actions. Sharpe régulier en toutes conditions. |
-| LIOFVS1 ID Equity | Lion Capital — Credit RV | Crédit Relative Value | Credit RV sur obligations et CDS. Valorisation mensuelle (stale ratio très élevé → tolérance portée à 95 % dans le code, documenté). Alpha de structure de capital. |
-| MUESEIH ID Equity | Muzinich — Senior Loans EUR | Senior Loans | Senior loans corporate EUR. Taux variable → protection naturelle contre la hausse des taux. Séniorité dans la structure de capital. Carry régulier avec faible vol. |
-
-### 4.3 Raisons de la shortlist (19 fonds)
-
-La pré-sélection qualitative d'une shortlist de 19 fonds avant tout filtre quantitatif est une décision méthodologique délibérée :
-
-- **Éviter le data mining** : tester tous les fonds alternatifs EUR disponibles et retenir ceux qui passent les filtres quantitatifs IS revient à faire du data mining. La shortlist impose une sélection qualitative antérieure à tout calcul.
-- **Critères qualitatifs appliqués** : track record ≥ 5 ans, gérant reconnu dans la stratégie, AUM ≥ 100 M USD, stratégie clairement définie et différenciée, décorrélation prouvée lors des crises passées, fonds domicilié EUR.
-- **Robustesse** : la shortlist n'est pas sensible à de petites variations de paramètres quantitatifs. Seul un changement de vue qualitative (nouveau gérant, stratégie dérivée, problème opérationnel) justifie de la modifier.
-
-### 4.4 Pipeline de filtrage quantitatif (fenêtre IS 2019-2020 uniquement)
-
-Cinq niveaux de filtrage sont appliqués séquentiellement, dans cet ordre :
-
-| Niveau | Critères | Description |
-|--------|----------|-------------|
-| **Niveau Bêta** | Filtre rolling bêta 3M vs Core équipondéré | `median(|β|) ≤ 35 %`, `q75(|β|) ≤ 55 %`, `|β| ≤ 35 %` sur ≥ 80 % des jours IS |
-| **Niveau 0** | Structurel universel | AUM ≥ 100 M$, premier prix ≤ 01/01/2019, devise EUR |
-| **Niveau 1** | Frais, Volatilité, Stale pricing | Frais ≤ seuil par stratégie, vol ∈ [vol_min, vol_max] par stratégie, stale ratio ≤ 10 % |
-| **Niveau 2** | Qualité quantitative | Sharpe IS ≥ -0,5 ; alpha annualisé ≥ -10 % ; max drawdown IS ≥ -50 % à -80 % selon bloc ; corrélation IS ≤ 45 % |
-| **Niveau 3** | Comportemental | Skewness IS ≥ -2,0 à -2,5 ; kurtosis IS ≤ 10 ; concentration ≤ 95 % |
-| **Filtre pairwise** | Cohérence inter-fonds | Corrélation pairwise IS ≤ 70 % entre fonds du même bloc retenus |
-
-### 4.5 Score composite décorrélation-first
-
-Après filtrage, chaque fonds passant tous les niveaux reçoit un **score composite z-scoré intra-bloc** :
-
-| Composante | Poids | Description |
-|------------|-------|-------------|
-| `-\|β_core\|` | 30 % | Priorité absolue à la décorrélation |
-| `-corr_core` | 10 % | Corrélation linéaire IS vs Core |
-| `Sortino` | 25 % | Rendement ajusté du risque de baisse |
-| `ret_rel_covid` | 15 % | Rendement relatif mars–mai 2020 (résilience COVID) |
-| `-dd_covid` | 10 % | Drawdown maximal pendant la crise COVID |
-| `Skewness` | 5 % | Asymétrie des rendements |
-| `-Kurtosis` | 5 % | Queues de distribution (risque de queues épaisses) |
-
-Le signe négatif sur `-|β_core|` traduit le principe *décorrélation-first* : un bêta faible est récompensé. Le poids élevé de la résilience COVID (25 % combiné entre `ret_rel_covid` et `-dd_covid`) garantit que les fonds retenus ont effectivement tenu lors du seul crash majeur de la période IS.
-
-### 4.6 Sélection finale : 2 + 3 + 2 fonds
-
-La sélection finale retient **7 fonds satellite** : 2 du Bloc 1, 3 du Bloc 2 et 2 du Bloc 3. Pour chaque bloc, les 2 fonds suivants dans le classement sont exportés en tant que **réserves** dans `satellite_reserves.csv`. Ces réserves permettent de substituer un fonds si son track record est insuffisant en OOS ou si le gérant subit un événement opérationnel.
+| Thème | Ticker Bloomberg | Nom |
+|-------|-----------------|-----|
+| Equity | XDWD GY Equity | Xtrackers MSCI World UCITS ETF |
+| Rates | EUNH GY Equity | iShares Core EUR Govt Bond UCITS ETF |
+| Credit | XBLC GY Equity | Xtrackers EUR Corporate Bond UCITS ETF |
 
 ---
 
-## 5. Moteur de portefeuille et vol-targeting
+## 4. Poche Core — Frontière efficiente et choix de la stratégie
 
-### Allocation Core / Satellite
+### Méthodologie
 
-Le module `portfolio_engine.py` implémente la fonction `calibrer_allocation()` qui :
+Sur la **fenêtre IS (2019-2020)**, on estime les rendements et la matrice de covariance des 3 ETFs Core à partir des rendements log-journaliers, puis on trace la **frontière efficiente** sous contraintes de poids.
 
-1. Calcule les rendements du portefeuille brut Core + Satellite selon les poids cibles `(w_core, w_sat)`.
-2. Applique un **vol-targeting** via `appliquer_vol_targeting()` pour ramener la volatilité annualisée dans la cible `[vol_target_min, vol_target_max] = [8 %, 12 %]`.
-3. Respecte les contraintes : `w_core ∈ [70 %, 75 %]`, `w_sat ≤ 30 %`, somme = 100 %, pas de levier.
+### Contraintes sur les poids
 
-### Vol-targeting anti-look-ahead
+| Paramètre | Valeur |
+|-----------|--------|
+| Poids minimum par ETF | 5 % |
+| Poids maximum par ETF | 90 % |
 
-Le signal de vol-targeting est calculé à la date *t* et appliqué aux rendements de la date *t+1* via `scale.shift(1)`. Ce décalage d'un jour est **essentiel** pour éviter un look-ahead bias : sans ce décalage, la volatilité du jour *t* serait utilisée pour pondérer le rendement du même jour *t*, ce qui n'est pas réalisable en production.
+Chaque ETF doit avoir au minimum 5 % d'allocation et ne peut pas dépasser 90 %, ce qui empêche les solutions dégénérées (tout sur un seul actif).
 
-### Allocation satellite en mode `beta_inverse`
+### Stratégies comparées
 
-Par défaut, la poche Satellite est allouée en mode `beta_inverse` : le poids de chaque fonds satellite est **inversement proportionnel à son bêta absolu IS** :
+Cinq types de stratégies sont évaluées sur la frontière IS, puis appliquées **fixement** sur la période OOS :
 
-```
-w_i ∝ 1 / (|β_i| + ε)
-```
+1. **Max Sharpe** : poids optimisés pour maximiser le ratio Sharpe IS
+2. **Min Variance** : poids optimisés pour minimiser la variance IS
+3. **Equal Weight** : 1/3 sur chaque ETF (benchmark naïf)
+4. **Risk Parity** : poids proportionnels à $1/\sigma_i$ (inverse de la volatilité IS)
+5. **Efficient Vol X %** : pour chaque cible de volatilité de 10 % à 20 % (par pas de 1 %), on trouve les poids qui maximisent le rendement sous la contrainte $\sigma_{portfolio} \leq X\%$
 
-Les fonds les plus décorrélés (bêta le plus proche de zéro) reçoivent donc les poids les plus élevés, renforçant le principe *décorrélation-first* dans l'allocation elle-même. L'epsilon `ε` évite les divisions par zéro pour les fonds strictement market-neutral.
+### Stratégie retenue : Efficient Vol 17 %
 
-**Autres modes disponibles :**
-- `score_prop` : pondération proportionnelle au score composite IS (softmax des scores)
-- `min_corr` : minimisation de la variance intra-satellite (optimisation SLSQP)
+Après comparaison des performances OOS de toutes les stratégies, la stratégie **Efficient Vol 17 %** est sélectionnée. Elle offre le meilleur compromis rendement/risque OOS.
 
-### Rebalancement
+Les poids résultants (calibrés sur IS, appliqués fixement sur OOS) sont :
 
-Le portefeuille est rebalancé **chaque trimestre** (63 jours ouvrés). Les poids Core sont recalibrés par Risk Parity rolling ; les poids Satellite restent fixes (poids IS appliqués tels quels en OOS).
+| ETF | Poids |
+|-----|-------|
+| **XDWD GY Equity** (actions) | **81,32 %** |
+| **EUNH GY Equity** (taux) | **13,68 %** |
+| **XBLC GY Equity** (crédit) | **5,00 %** |
 
----
-
-## 6. Fenêtres temporelles — Choix IS/OOS et justification
-
-| Fenêtre | Dates | Usage |
-|---------|-------|-------|
-| Warm-up Core | 2018-01-01 → 2018-12-31 | Initialisation du lookback 252j sans utiliser les données IS |
-| In-Sample (IS) | 2019-01-01 → 2020-12-31 | Sélection ETFs Core, sélection fonds Satellite, calibration poids |
-| Out-of-Sample (OOS) | 2021-01-01 → 2025-12-31 | Validation pure, aucun paramètre recalibré |
-
-### Justification de la fenêtre IS 2019-2020
-
-La fenêtre IS 2019-2020 a été choisie pour sa propriété *"through-the-cycle"* :
-
-- **2019** : régime de bull market, hausse des actifs risqués, faible volatilité. Les fonds à fort bêta performent bien.
-- **T1 2020** : crash COVID brutal (-35 % sur les indices en 5 semaines). Les fonds à bêta élevé sont sévèrement touchés. Les fonds sélectionnés dans ce cadre ont prouvé leur résistance.
-
-Cette combinaison garantit que les fonds retenus ont été testés dans deux régimes opposés, réduisant le risque de sélection sur un unique régime favorable.
-
-### Justification de `max_start_date = "2019-01-01"`
-
-Chaque fonds satellite doit avoir son premier prix ≤ 01/01/2019. Cela garantit :
-- Au moins 1 an de track record avant la crise COVID (mars 2020)
-- Que les filtres quantitatifs IS sont calculés sur des données représentatives, incluant le crash COVID
-
-### Note sur le chevauchement IS/OOS
-
-La sélection des ETFs Core et la calibration rolling partagent les mêmes données source (depuis 2019). Ce n'est **pas un look-ahead bias** — aucune donnée future n'est utilisée dans les décisions de poids. Ce chevauchement reflète la pratique réelle d'un gérant calibrant son processus sur l'historique disponible au moment du lancement (janvier 2021).
-
-Le `warm_up_start = "2018-01-01"` dans `core_pipeline.py` atténue ce chevauchement en permettant au lookback de s'initialiser avant la période IS : les 252 premières observations du lookback proviennent de 2018, et non de 2019.
+L'allocation est fortement orientée actions (81 %), ce qui est cohérent avec une cible de volatilité élevée (17 %). Le crédit est au minimum (5 %) car son profil rendement/risque IS ne justifiait pas une allocation plus importante.
 
 ---
 
-## 7. Métriques et attribution de performance
+## 5. Poche Core — Simulation et rebalancement
 
-### Métriques (`metrics.py`)
+### Principe
 
-| Métrique | Définition | Note |
-|----------|-----------|------|
-| Volatilité annualisée | `σ_daily × √252` | Sur les rendements log-journaliers |
-| Sharpe | `(1+r_moy)^252 - 1) / σ_ann` | `rf = 0` (voir note ci-dessous) |
-| Sortino | `ret_ann / σ_downside_ann` | Seuls les rendements négatifs dans le dénominateur |
-| Max Drawdown | `min((cum / peak) - 1)` | Drawdown maximum sur la période |
-| Calmar | `ret_ann / |max_drawdown|` | Rendement sur risque de drawdown |
+Une fois les poids cibles définis par la frontière efficiente, on simule le portefeuille Core sur toute la période OOS (2021→2025) en intégrant :
+- Le **rebalancement** périodique vers les poids cibles
+- Les **frais TER** propres à chaque ETF (déduits quotidiennement)
+- Les **coûts de transaction** à chaque rebalancement
 
-**Note sur le taux sans risque** : toutes les métriques Sharpe/alpha sont calculées en **excess-return** vs un proxy Bund 10 ans obtenu via `risk_free.py` (source FRED) avec fallback constant **2 % annualisé** si l'API est indisponible. Le proxy est aligné sur l'index des séries utilisées (IS et OOS) pour éviter toute incohérence de datation.
+### Paramètres de simulation
 
-### Attribution (`attribution.py`)
+| Paramètre | Valeur |
+|-----------|--------|
+| Fréquence de rebalancement | **Annuelle** (1er jour de trading de chaque année) |
+| Coût de transaction | **10 bps par côté** (achat et vente) |
+| Frais fixes additionnels | 0 bps |
+| Valeur initiale du portefeuille | 100 (base) |
+| Période simulée | 01/01/2021 → 31/12/2025 |
 
-Le module `attribution.py` implémente une **régression OLS rolling sur 36 mois** :
+### Mécanique du rebalancement
 
-```
-r_portfolio(t) = alpha_daily + beta × r_core(t) + eps(t)
-```
+À chaque date de rebalancement :
+1. On observe la **valeur de marché** de chaque position (les poids ont dérivé depuis le dernier rebalancement du fait des performances relatives des ETFs)
+2. On calcule l'**écart** entre poids effectifs et poids cibles
+3. On achète/vend pour **revenir aux poids cibles**
+4. Un **coût de transaction de 10 bps** est appliqué sur le montant en valeur absolue de chaque ajustement
 
-- **Alpha annualisé** : `(1 + alpha_daily)^252 - 1` (composition géométrique, cohérente avec les rendements log)
-- **Bêta rolling** : sensibilité du portefeuille au Core sur la fenêtre glissante de 36 mois
-- **Attribution** : la contribution de la poche Satellite à l'alpha total est identifiable par la différence entre l'alpha total et l'alpha de la poche Core seule
+Entre deux dates de rebalancement, les poids dérivent naturellement avec les marchés (pas de rebalancement intra-période).
 
----
+### Application des TER
 
-## 8. Architecture technique du code
+Les frais TER de chaque ETF sont déduits quotidiennement sous forme d'un *drag* :
 
-Les modules sont organisés en **pipeline séquentiel** : Core → Satellite → Construction → Rapports.
+$$r_{net,i}(t) = \frac{1 + r_{brut,i}(t)}{1 + TER_{daily,i}} - 1$$
 
-```
-cross_asset/
-├── data/
-│   ├── univers_core_etf_eur_daily_wide_VF.xlsx  # Prix + metadata ETFs Core (3 thèmes)
-│   ├── STRAT1_info.xlsx / STRAT1_price.xlsx     # Metadata + prix fonds Satellite Bloc 1
-│   ├── STRAT2_info.xlsx / STRAT2_price.xlsx     # idem Bloc 2
-│   └── STRAT3_info.xlsx / STRAT3_price.xlsx     # idem Bloc 3
-├── src/
-│   ├── risk_free.py                 # Proxy Bund 10Y + Sharpe excess
-│   ├── core_pipeline_corrected.py   # Pipeline ETF Core : lecture, filtrage, sélection, backtest rolling
-│   ├── satellite_pipeline_corrected.py # Pipeline Satellite : shortlist, filtres IS, scoring, sélection
-│   ├── fond_construction_corrected.py # Construction fonds final : allocation Core+Sat, vol-targeting
-│   ├── portfolio_engine.py          # Moteur d'allocation : Risk Parity, vol-targeting
-│   ├── efficient_frontier_core.py   # Frontière efficiente (outil d'analyse/diagnostic)
-│   ├── plots_report.py              # Rapport graphique complet (28 figures)
-│   ├── fees.py                      # Estimation des frais totaux (bps/an)
-│   └── attribution.py               # Attribution alpha/beta
-├── outputs/                         # Fichiers générés automatiquement par les pipelines
-│   ├── core_selected_etfs.csv
-│   ├── core_returns_daily_is.csv / core_returns_daily_oos.csv
-│   ├── core3_etf_daily_log_returns.csv / core3_etf_daily_simple_returns.csv
-│   ├── satellite_selected.csv / satellite_selected_v3.csv / satellite_reserves.csv
-│   ├── fond_returns_daily.csv / fond_weights.csv / fond_metrics.csv / fond_annual_perf.csv
-│   └── figures/
-├── tests/                           # Scripts d’analyses complémentaires (benchmarks/sensitivité)
-├── main.ipynb                       # Notebook d'orchestration principal
-├── requirements.txt
-└── README.md
-```
+où $TER_{daily,i} = (1 + TER_{annual,i})^{1/252} - 1$.
 
-### Flux de données entre modules
+### Sortie
 
-```
-core_pipeline.py
-    → outputs/core_selected_etfs.csv
-    → outputs/core_returns_daily_is.csv
-    → outputs/core_returns_daily_oos.csv
-    → outputs/core3_etf_daily_log_returns.csv
-
-satellite_pipeline.py  (lit core3_etf_daily_log_returns.csv)
-    → outputs/satellite_selected.csv
-    → outputs/satellite_selected_v3.csv
-    → outputs/satellite_reserves.csv
-
-fond_construction.py  (lit core_returns_daily_oos.csv + satellite_selected_v3.csv + prix STRAT)
-    → outputs/fond_returns_daily.csv
-    → outputs/fond_weights.csv
-    → outputs/fond_metrics.csv
-    → outputs/fond_annual_perf.csv
-
-plots_report.py  (lit tous les outputs)
-    → rapports graphiques (24 figures)
-```
+La simulation produit une **série de NAV (Net Asset Value)** quotidienne du portefeuille Core, intégrant rebalancement, frais et coûts de transaction. C'est cette série qui sert de benchmark pour toute la suite (sélection Satellite, comparaison Core vs Satellite, allocation finale).
 
 ---
 
-## 9. Installation et exécution
+## 6. Détection du régime de marché
 
-```bash
-# 1. Cloner le repo
-git clone https://github.com/HUGO-ROCHA-MONDRAGON/Core_Satellite_Quant.git
-cd Core_Satellite_Quant
+Le portefeuille Satellite adapte son allocation interne (poids des 3 blocs) au **régime de marché** détecté sur les rendements du Core. Cette détection est **causale** : chaque décision ne repose que sur des données passées.
 
-# 2. Créer un environnement virtuel
-python -m venv .venv
-source .venv/bin/activate  # Windows : .venv\Scripts\activate
+### Les 3 régimes
 
-# 3. Installer les dépendances
-pip install -r requirements.txt
+| Régime | Interprétation | Implication Satellite |
+|--------|----------------|-----------------------|
+| **Stress** | Vol élevée, corrélations accrues, momentum négatif | Surpondérer le bloc 1 (décorrélation / convexité) |
+| **Neutre** | Conditions normales de marché | Équilibrer les 3 blocs |
+| **Risk-on** | Vol basse, momentum positif | Surpondérer le bloc 3 (carry / crédit) |
 
-# 4. Exécuter le pipeline complet (ordre recommandé)
-python -m src.core_pipeline_corrected        # Étape 1 : Sélection et backtest Core
-python -m src.satellite_pipeline_corrected   # Étape 2 : Sélection fonds Satellite
-python -m src.fond_construction_corrected    # Étape 3 : Construction fonds final
-python -m src.plots_report                   # Étape 4 : Génération des graphiques
+### Construction de l'indicateur
 
-# Ou via le notebook
-jupyter notebook main.ipynb
-```
+L'indicateur de régime est composite, construit à partir de 3 métriques rolling sur les rendements du Core (pondérés par les poids de la stratégie sélectionnée, nets de TER) :
 
-**Prérequis :** Python ≥ 3.10, les fichiers de données dans `data/` (non inclus dans le repo pour des raisons de confidentialité Bloomberg).
+1. **Volatilité rolling 63 jours** ($\sigma_{63}$) : mesure de la turbulence récente
+2. **Corrélation rolling equity-bonds 63 jours** ($\rho_{eq,bonds}$) : quand cette corrélation monte, les actifs sont entraînés ensemble — signe de stress
+3. **Momentum rolling 63 jours** ($mom_{63}$) : rendement cumulé sur 63 jours — un momentum négatif signale une tendance baissière
 
-**Dépendances principales :**
+### Score de régime
 
-| Librairie | Usage |
-|-----------|-------|
-| `pandas` | Manipulation des séries temporelles |
-| `numpy` | Calcul matriciel et statistiques |
-| `scipy` | Optimisation (SLSQP), régression OLS |
-| `scikit-learn` | Ledoit-Wolf shrinkage (covariance) |
-| `matplotlib` / `seaborn` | Visualisation |
-| `openpyxl` | Lecture des fichiers Excel |
+Chaque indicateur est converti en **z-score rolling** (fenêtre 315 jours, minimum 189 observations) pour le rendre comparable dans le temps. Le score de régime est ensuite :
 
----
+$$RegimeScore(t) = z_{vol}(t-1) + z_{corr}(t-1) - z_{mom}(t-1)$$
 
-## 10. Structure des fichiers
+**Interprétation** : un score élevé → vol élevée, corrélation élevée, momentum négatif → stress. Un score faible → le contraire → risk-on.
 
-```
-Core_Satellite_Quant/
-├── src/
-│   ├── core_pipeline.py
-│   ├── satellite_pipeline.py
-│   ├── fond_construction.py
-│   ├── portfolio_engine.py
-│   ├── attribution.py
-│   ├── efficient_frontier_core.py
-│   ├── fees.py
-│   └── plots_report.py
-├── data/
-│   ├── univers_core_etf_eur_daily_wide_VF.xlsx
-│   ├── STRAT1_info.xlsx
-│   ├── STRAT1_price.xlsx
-│   ├── STRAT2_info.xlsx
-│   ├── STRAT2_price.xlsx
-│   ├── STRAT3_info.xlsx
-│   └── STRAT3_price.xlsx
-├── outputs/
-│   ├── core_returns_daily_oos.csv
-│   ├── core_returns_daily_is.csv
-│   ├── core_selected_etfs.csv
-│   ├── core3_etf_daily_log_returns.csv
-│   ├── satellite_selected.csv
-│   ├── satellite_selected_v3.csv
-│   ├── satellite_reserves.csv
-│   ├── fond_returns_daily.csv
-│   ├── fond_weights.csv
-│   ├── fond_metrics.csv
-│   └── fond_annual_perf.csv
-├── tests/
-│   └── sensitivity_analysis.py
-├── main.ipynb
-├── requirements.txt
-└── README.md
-```
+Le **décalage de 1 jour** sur toutes les composantes (shift) assure la causalité : le score à la date $t$ ne dépend que de données jusqu'à $t-1$.
+
+### Seuils et classification
+
+Les seuils de transition entre régimes sont **rolling et calibrés sur l'In-Sample** :
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Fenêtre rolling des seuils | 630 jours |
+| Quantile bas (seuil Risk-on) | 30ᵉ percentile |
+| Quantile haut (seuil Stress) | 70ᵉ percentile |
+
+La classification est :
+- $RegimeScore \leq q_{30\%}^{rolling}$ → **Risk-on**
+- $RegimeScore \geq q_{70\%}^{rolling}$ → **Stress**
+- entre les deux → **Neutre**
+
+Les seuils rolling sont initialisés avec les quantiles IS (2019-2020), puis recalculés de façon glissante. Le shift(1) est appliqué aux seuils eux-mêmes pour garantir l'absence de look-ahead.
+
+### Lissage causal
+
+Pour éviter le *signal whipsaw* (oscillations rapides entre régimes), un **lissage de 7 jours minimum** est appliqué : un changement de régime ne prend effet que s'il persiste au moins 7 jours consécutifs. Ce lissage est causal (il ne regarde pas le futur).
+
+### Optimisation sous grille
+
+Les paramètres de régime (fenêtres d'indicateurs, de z-score, de seuils, quantiles) sont optimisés par **grid search** sur la période IS. L'objectif est de trouver la combinaison qui maximise une métrique de cohérence économique (ex. : le régime Stress doit effectivement correspondre à des périodes de vol élevée et drawdown important).
 
 ---
 
-## 11. Notes méthodologiques importantes (anti-biais)
+## 7. Poche Satellite — Filtre structurel (Level 0)
 
-Le tableau suivant récapitule les points de contrôle anti-biais implémentés dans le code :
+Les fonds candidats sont issus de 3 univers (STRAT1, STRAT2, STRAT3) correspondant aux 3 blocs du Satellite. Avant tout calcul quantitatif, un **filtre structurel** élimine les fonds inadaptés.
 
-| Point de contrôle | Mécanisme | Statut |
-|---|---|---|
-| Séparation IS/OOS | `score_start/end` vs `oos_start/end` séparés dans `CoreConfig` et `FondConfig` | ✅ Propre |
-| Vol-targeting sans look-ahead | `scale.shift(1)` — signal calculé à *t* appliqué à *t+1* | ✅ Propre |
-| Métriques satellite uniquement IS | `calculer_metriques_calib()` restreinte à `[calib_start, calib_end]` | ✅ Propre |
-| Backtest rolling Core | Poids calculés sur `window = rets.iloc[start-lookback:start]`, appliqués sur `oos = rets.iloc[start:start+rebal_freq]` | ✅ Propre |
-| Bêta rolling satellite | Calculé sur toute l'histoire mais filtré sur IS uniquement pour la sélection | ✅ Propre |
-| Warm-up Core | `warm_up_start = "2018-01-01"` permet l'initialisation du lookback avant IS | ✅ Documenté |
-| Chevauchement sélection/calibration Core | Données IS partagées entre sélection ETF et calibration rolling — documenté, non look-ahead | ⚠️ Documenté |
-| `ffill` limité | `ffill(limit=5)` sur prix satellites pour éviter masquage de trous prolongés | ✅ Propre |
-| Détection TER décimal/% | Seuil de détection corrigé à 0,05 (robuste pour ETFs < 10 bps) | ✅ Corrigé |
-| Audit track record | Affichage informatif du premier prix et nombre d'observations IS/OOS par fonds | ✅ Documenté |
+### Critères Level 0
+
+| Critère | Seuil | Justification |
+|---------|-------|---------------|
+| **Devise** | Euro uniquement | Le fonds est domicilié EUR, on ne veut pas de risque de change non contrôlé |
+| **AUM** (Actifs sous gestion) | > 50 M USD | Filtre de liquidité et de pérennité du gérant |
+
+### Devise : précision importante
+
+Seuls les fonds dont la devise est strictement **"Euro"** sont retenus. Les variantes historiques comme "Euro (BEF)" sont exclues pour éviter d'inclure des classes de parts d'un autre pays ou des fonds ayant changé de devise lors du passage à l'EUR.
+
+### Résultat
+
+Sur ~300+ fonds disponibles dans STRAT1+STRAT2+STRAT3, environ **166 fonds** passent le Level 0 après filtrage devise + AUM.
 
 ---
 
-## 12. Limites connues et pistes d'amélioration
+## 8. Poche Satellite — Filtre beta rolling (Level 1)
 
-1. **Shortlist codée en dur** : les 19 fonds sont sélectionnés qualitativement et codés dans `SATELLITE_SHORTLIST`. La robustesse à un changement de shortlist n'est pas testée automatiquement. *Piste :* ajouter un test de sensibilité sur la shortlist (ex. leave-one-out).
+L'objectif central de la poche Satellite est la **décorrélation** vis-à-vis du Core. Le Level 1 applique un filtre de bêta rolling strict pour ne garder que les fonds structurellement à faible bêta.
 
-2. **`rf = 0` dans les Sharpe** : acceptable pour la construction du portefeuille, mais à paramétrer pour le reporting client institutionnel (€STR, OAT 10 ans ou autre taux de référence EUR).
+### Le bêta rolling
 
-3. **Dates COVID hardcodées** : `covid_start = "2020-02-01"`, `covid_end = "2020-05-31"` sont correctes mais hardcodées dans `calculer_metriques_calib()`. *Piste :* les ajouter en paramètres de `SatelliteConfig` pour faciliter la ré-utilisation sur d'autres épisodes de stress.
+Pour chaque fonds, on calcule un bêta rolling vis-à-vis du benchmark Core (la série pondérée des 3 ETFs selon la stratégie "Efficient Vol 17 %") sur une fenêtre glissante de **126 jours** (~6 mois).
 
-4. **Univers Core limité à l'Europe** : `equity_exposure_keywords = ("Europe",)` est une contrainte de conception du fonds EUR institutionnel. Un fonds global nécessiterait une gestion du risque de change et un ajustement de cette contrainte.
+$$\beta_{fund}(t) = \frac{Cov(r_{fund}, r_{core})}{Var(r_{core})} \quad \text{sur } [t-126, t]$$
 
-5. **Absence de coûts de transaction dans le backtest** : les coûts de rebalancement (bid-ask spread ETF, frais d'entrée fonds alternatifs, impact de marché) ne sont pas modélisés en dehors du budget TER. *Piste :* ajouter un modèle de coûts proportionnels au turnover trimestriel.
+### Conditions de passage
 
-6. **Fonds à valorisation mensuelle** : certains fonds Satellite (Bloc 3) ont une valorisation mensuelle. Le `ffill(limit=5)` actuel peut sous-estimer leur stale ratio réel. Ces fonds ont des tolérances de stale ratio élargies documentées dans le code (`STALE_OVERRIDE` dans `satellite_pipeline.py`).
+Un fonds passe le Level 1 si **les 3 conditions suivantes sont simultanément remplies** sur la fenêtre de calibration :
 
+| Condition | Seuil | Signification |
+|-----------|-------|---------------|
+| Médiane du bêta absolu | ≤ **0,50** | Le bêta typique est contenu |
+| 75ᵉ percentile du bêta absolu | ≤ **0,70** | Même dans les queues, le bêta reste raisonnable |
+| Ratio de passage | ≥ **60 %** | Au moins 60 % du temps, le bêta absolu est ≤ 0,50 |
+
+### Fenêtre de calibration
+
+La fenêtre de calibration du Level 1 est **glissante** et dépend de la date de revue annuelle. Pour chaque revue annuelle (voir section 11), la fenêtre de calibration est :
+
+$$[review\_date - 2\text{ ans}, \ review\_date - 1\text{ jour}]$$
+
+Par exemple, pour la revue du 01/04/2021, la calibration utilise les données du 01/04/2019 au 31/03/2021. Le **–1 jour** est essentiel pour éviter tout look-ahead.
+
+---
+
+## 9. Poche Satellite — Scoring alpha + frais (Level 2)
+
+Les fonds ayant passé le Level 1 sont classés par un **score composite alpha + frais** au sein de chaque STRAT.
+
+### Calcul de l'alpha
+
+Pour chaque fonds, sur la même fenêtre de calibration glissante :
+
+$$\alpha_{annual} = r_{annual,fund} - \beta_{fund} \times r_{annual,core}$$
+
+C'est l'alpha de Jensen : le rendement résiduel du fonds après neutralisation de sa composante de marché. Un fonds avec un alpha élevé génère du rendement indépendamment du Core.
+
+### Calcul du score Level 2
+
+$$score_{L2} = \alpha_{weight} \times z(\alpha_{annual}) + expense_{weight} \times z(-expense\_pct)$$
+
+| Paramètre | Valeur |
+|-----------|--------|
+| $\alpha_{weight}$ | **0,6** (60 %) |
+| $expense_{weight}$ | **0,4** (40 %) |
+| Observations minimales pour le calcul d'alpha | 60 jours |
+| Nombre de fonds retenus par STRAT | Top **7** |
+
+Les composantes sont des **z-scores intra-STRAT** : on standardise les valeurs au sein de chaque bloc pour que les scores soient comparables entre fonds d'un même univers.
+
+Le signe négatif sur le ratio de dépenses ($-expense\_pct$) signifie qu'un fonds moins cher a un meilleur score.
+
+### Résultat
+
+Après le Level 2, on conserve les **7 meilleurs fonds par STRAT** (soit 21 fonds au total dans le pool).
+
+---
+
+## 10. Poche Satellite — Scoring personnalisé par bloc
+
+Après le Level 2, un **scoring personnalisé** est appliqué en fonction du bloc (STRAT) auquel appartient le fonds. Ce scoring reflète la philosophie d'investissement propre à chaque bloc.
+
+### Métriques calculées pour le scoring
+
+Pour chaque fonds, sur la fenêtre de calibration, on calcule en plus des métriques Level 2 :
+
+| Métrique | Description |
+|----------|-------------|
+| $\beta_{stress}$ | Bêta du fonds calculé uniquement sur les jours de stress Core (bottom 20 % des rendements Core) |
+| $\beta_{bloc1}$ | = $\beta_{stress}$ si disponible, sinon $\beta$ standard |
+| $corr$ | Corrélation simple rendements fonds vs Core |
+| $return_{stress}$ | Rendement annualisé du fonds sur les jours de stress uniquement |
+| $sharpe$ | Ratio de Sharpe (rendement ann. / vol ann.) |
+| $sortino$ | Ratio de Sortino (rendement ann. / vol downside) |
+| $maxdd$ | Drawdown maximum |
+| $skewness$ | Asymétrie de la distribution des rendements |
+| $kurtosis$ | Aplatissement (queues lourdes) |
+| $ret_{ann}$ | Rendement annualisé |
+| $vol$ | Volatilité annualisée |
+
+### Formules de scoring par bloc
+
+Toutes les composantes sont des **z-scores intra-STRAT**.
+
+#### STRAT1 — Décorrélation / Convexité
+
+$$score_{STRAT1} = -0{,}40 \times z(|\beta_{bloc1}|) - 0{,}20 \times z(|corr|) + 0{,}20 \times z(return_{stress}) + 0{,}15 \times z(sharpe) - 0{,}15 \times z(maxdd)$$
+
+**Philosophie** : ce bloc vise des fonds qui tiennent ou performent en période de stress. On pénalise fortement le bêta stress (40 %) et la corrélation (20 %), on récompense le rendement en stress (20 %) et le Sharpe (15 %), et on pénalise les drawdowns (15 %).
+
+#### STRAT2 — Alpha Hunters
+
+$$score_{STRAT2} = 0{,}60 \times z(\alpha_{annual}) + 0{,}30 \times z(-expense\_pct) + 0{,}10 \times z(sharpe) - 0{,}05 \times z(|corr|)$$
+
+**Philosophie** : ce bloc recherche l'alpha pur. L'alpha domine le score (60 %), les frais sont un critère secondaire important (30 %), le Sharpe apporte un léger bonus (10 %), et une faible corrélation est marginalement recherchée (5 %).
+
+#### STRAT3 — Growth + Quality (Carry / Crédit)
+
+$$score_{STRAT3} = 0{,}55 \times z(\alpha_{annual}) + 0{,}35 \times z(-expense\_pct) + 0{,}10 \times z(ret_{ann}) - 0{,}05 \times z(kurtosis)$$
+
+**Philosophie** : ce bloc vise le carry et le crédit structuré. L'alpha est central (55 %), les frais sont pénalisés (35 %), le rendement brut apporte un léger avantage (10 %), et les fonds à queues trop lourdes (kurtosis élevé) sont légèrement pénalisés (5 %).
+
+---
+
+## 11. Poche Satellite — Sélection annuelle et trimestrielle glissante
+
+La sélection Satellite est un processus en **deux temps** : une revue annuelle du pool, puis des révisions trimestrielles avec logique de switching.
+
+### Revue annuelle (constitution du pool)
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Date de la 1ère revue OOS | **01/04/2021** |
+| Fréquence | Annuelle (chaque 1er avril) |
+| Lookback pour les filtres/scores | **2 ans** glissants |
+
+À chaque revue annuelle :
+1. On applique le **Level 1** (bêta rolling) sur la fenêtre $[review - 2\text{ ans},\ review - 1\text{ jour}]$
+2. On applique le **Level 2** (alpha + expense) sur la même fenêtre
+3. On applique le **scoring personnalisé par bloc** sur la même fenêtre
+4. On conserve les **top 7 par STRAT** → c'est le **pool actif** valide jusqu'à la prochaine revue annuelle
+
+### Revue trimestrielle (sélection depuis le pool)
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Fréquence de la sélection | **Trimestrielle**, calée sur le calendrier QS-APR (avril, juillet, octobre, janvier) |
+| Rescoring trimestriel | **Oui** — le pool est rescoré sur une fenêtre 2 ans glissante avant chaque sélection |
+| Nombre max de fonds par STRAT | **2** |
+
+À chaque date trimestrielle :
+1. Le pool annuel est **rescoré** sur $[qdate - 2\text{ ans},\ qdate - 1\text{ jour}]$ avec les formules par bloc
+2. Pour chaque STRAT, le **top 1** est sélectionné (meilleur score)
+3. Un **2ᵉ fonds** est ajouté si les conditions de diversification sont remplies :
+
+| Condition pour le 2ᵉ fonds | Seuil |
+|-----------------------------|-------|
+| Corrélation pairwise avec le top 1 | ≤ **0,70** |
+| Écart de score vs top 1 | ≤ **1,5** |
+
+### Logique de switching (buffer anti-turnover)
+
+Pour limiter le turnover, un **buffer de score de 0,30** est appliqué aux transitions :
+
+- Si le fonds détenu est le même que le candidat → **pas de changement**
+- Si le candidat a un score supérieur au fonds détenu **+ 0,30** → **switch** vers le candidat
+- Sinon → **conservation du fonds détenu** (hold)
+
+Cela évite les changements de fonds pour de petites différences de score, réduisant les coûts de transaction effectifs.
+
+### Dédupplication
+
+Si le même ticker est sélectionné pour deux rangs différents dans un même STRAT (résultat d'un hold et d'un nouveau candidat identique), le système le détecte et sélectionne un fonds alternatif pour éviter de doubler la même exposition.
+
+---
+
+## 12. Allocation dynamique intra-Satellite par régime
+
+Une fois les fonds Satellite sélectionnés (2 par STRAT maximum), les poids de chaque **bloc** varient dynamiquement en fonction du **régime de marché** détecté (section 6).
+
+### Poids par régime
+
+| Régime | Bloc 1 (STRAT1) — Décorrélation | Bloc 2 (STRAT2) — Alpha | Bloc 3 (STRAT3) — Carry |
+|--------|----------------------------------|--------------------------|--------------------------|
+| **Stress** | **50 %** | 30 % | 20 % |
+| **Neutre** | 30 % | **40 %** | 30 % |
+| **Risk-on** | 15 % | 35 % | **50 %** |
+
+**Logique économique** :
+- En **stress**, on surpondère massivement le bloc 1 (50 %) car les fonds de type CTA / convexité sont censés tenir ou profiter des tendances baissières
+- En **neutre**, le bloc 2 (alpha décorrélé) est majoritaire (40 %), car c'est le contexte optimal pour les stratégies market neutral
+- En **risk-on**, on surpondère le bloc 3 (50 %) car le carry / crédit structuré bénéficie d'un environnement de spreads comprimés et de faible volatilité
+
+### Répartition intra-bloc
+
+Au sein de chaque bloc, le poids est réparti **équitablement** entre les fonds actifs de ce trimestre. Si un bloc contient 2 fonds actifs, chacun reçoit la moitié du poids du bloc. Si un seul fonds est actif, il reçoit 100 % du poids du bloc.
+
+### Gestion des blocs vides
+
+Si un bloc n'a aucun fonds actif (aucun fonds n'a passé les filtres pour ce STRAT), son poids est **redistribué proportionnellement** aux blocs actifs. Les poids sont ensuite renormalisés pour sommer à 100 % de la poche Satellite.
+
+---
+
+## 13. Performance Satellite et contributions par bloc
+
+### Calcul des rendements Satellite
+
+Le rendement quotidien de la poche Satellite est la somme pondérée des rendements de chaque fonds actif :
+
+$$r_{satellite}(t) = \sum_i w_i(t-1) \times r_i(t)$$
+
+Les poids sont pris **au jour t−1** pour éviter le look-ahead : on utilise les poids de l'allocation connue la veille pour pondérer les rendements du jour.
+
+### Contributions par bloc
+
+Pour chaque bloc, la contribution quotidienne est :
+
+$$contrib_{bloc}(t) = \sum_{i \in bloc} w_i(t) \times r_i(t)$$
+
+Cela permet d'identifier quel bloc est le moteur de la performance Satellite — et si la logique d'allocation par régime ajoute effectivement de la valeur.
+
+### Métriques sur le Satellite
+
+On calcule :
+- NAV cumulée du Satellite
+- Drawdown glissant
+- Volatilité rolling 63 jours
+- Bêta rolling vs Core
+- Rendement annualisé, Sharpe, Calmar
+
+---
+
+## 14. Comparaison Core vs Satellite
+
+### Source des rendements Core
+
+Le rendement Core utilisé pour la comparaison provient de la **NAV simulée du portefeuille Core** (section 5), pas de la moyenne simple des 3 ETFs. C'est donc le rendement réel du portefeuille Core après rebalancement et TER.
+
+### Source des rendements Satellite
+
+Le rendement Satellite est celui calculé à la section 13. Les poids Satellite t−1 sont appliqués aux rendements de prix t, avec un recouvrement sur les dates communes Core/Satellite.
+
+### Métriques comparatives
+
+| Métrique | Description |
+|----------|-------------|
+| Bêta statique (Satellite vs Core) | Sensibilité globale du Satellite au Core |
+| Corrélation statique | Corrélation linéaire sur toute la période |
+| Tracking error | Écart-type annualisé de $r_{satellite} - r_{core}$ |
+| Alpha annualisé | Rendement excédentaire du Satellite après neutralisation du bêta |
+| Bêta rolling 63 jours | Évolution du bêta dans le temps (vérifie que la décorrélation tient en OOS) |
+| Corrélation rolling 63 et 126 jours | Évolution de la corrélation |
+| Alpha rolling | Détection de périodes où le Satellite génère ou détruit de l'alpha |
+
+### Dashboard 8 panneaux
+
+L'analyse produit 8 graphiques :
+1. NAV cumulée Core vs Satellite
+2. Drawdown comparé
+3. Bêta rolling 63j et 126j
+4. Corrélation rolling 63j et 126j
+5. Alpha rolling 63j et 126j
+6. Rendements annuels comparés
+7. Cross-métriques (Sharpe, Max DD, Calmar)
+8. Scatter plot rendements quotidiens
+
+---
+
+## 15. Frais Satellite
+
+### Données de frais
+
+Les ratios de dépenses (TER) de chaque fonds sont extraits des fiches Bloomberg (champ `Ratio des dépenses`). Ils sont exprimés en pourcentage annuel.
+
+### TER pondéré du Satellite
+
+Chaque jour, le TER effectif du Satellite est la somme pondérée des TER individuels :
+
+$$TER_{sat}(t) = \sum_i w_i(t) \times TER_i$$
+
+Ce TER pondéré est exprimé en **bps/an** et suivi dans le temps. Il permet de vérifier que le fonds respecte un budget de frais raisonnable (objectif ≤ 80 bps).
+
+### Imputation des TER manquants
+
+Si le TER d'un fonds n'est pas disponible, il est imputé par la **médiane des TER** des autres fonds de la même STRAT.
+
+---
+
+## 16. Allocation dynamique Core / Satellite (vol-targeting)
+
+### Principe
+
+L'allocation entre Core et Satellite n'est pas fixe — elle est **dynamiquement ajustée chaque mois** pour cibler une **volatilité globale ex ante de 10 % annualisée**.
+
+### Algorithme
+
+Chaque fin de mois :
+
+1. **Calcul des risques rolling** (fenêtre 63 jours) :
+   - $\sigma_{core}$ : volatilité annualisée du Core
+   - $\sigma_{sat}$ : volatilité annualisée du Satellite
+   - $\rho_{core,sat}$ : corrélation Core/Satellite
+
+2. **Volatilité ex-ante du portefeuille** pour un poids Satellite $w_{sat}$ :
+
+$$\sigma_{pf} = \sqrt{(1-w_{sat})^2 \sigma_{core}^2 + w_{sat}^2 \sigma_{sat}^2 + 2(1-w_{sat})w_{sat}\rho\sigma_{core}\sigma_{sat}}$$
+
+3. **Vérification de la bande morte (deadband)** :
+   - Si $\sigma_{pf}$ avec les poids actuels est dans $[9{,}5\% \ ;\ 10{,}5\%]$ → **pas de rebalancement** (on conserve les poids)
+   - Sinon → on cherche le meilleur $w_{sat}$ dans la grille
+
+4. **Optimisation sur grille** :
+   - On teste $w_{sat} \in \{25\%, 26\%, 27\%, 28\%, 29\%, 30\%\}$ (pas de 1 %)
+   - On retient le $w_{sat}$ dont la vol ex-ante est **la plus proche** de la cible 10 %
+
+5. **Application** : le nouveau $w_{sat}$ s'applique au jour suivant ($w_{core} = 1 - w_{sat}$)
+
+### Paramètres
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Lookback vol/corr | **63 jours** (~3 mois) |
+| Fréquence de rebalancement | **Mensuelle** (fin de mois) |
+| Volatilité cible | **10 %** annualisé |
+| Deadband | **± 0,5 %** (soit [9,5 % ; 10,5 %]) |
+| $w_{sat}$ minimum | **25 %** |
+| $w_{sat}$ maximum | **30 %** |
+| Pas de la grille | **1 %** |
+| $w_{sat}$ initial | **25 %** |
+
+### Logique du deadband
+
+Le deadband est un mécanisme anti-turnover : si la volatilité est déjà proche de la cible, on ne modifie pas les poids. Cela évite les micro-ajustements coûteux et réduit le bruit.
+
+---
+
+## 17. Portefeuille final — Dashboard et métriques
+
+### Rendement du portefeuille global
+
+$$r_{global}(t) = w_{core}(t-1) \times r_{core}(t) + w_{sat}(t-1) \times r_{sat}(t)$$
+
+Les poids sont **laggés d'un jour** (t−1) — on investit avec les poids de la veille, on reçoit les rendements du jour.
+
+### Métriques calculées
+
+Pour chaque composante (portefeuille global, Core seul, Satellite seul) :
+
+| Métrique | Formule |
+|----------|---------|
+| Rendement cumulé total | $\prod(1 + r_t) - 1$ |
+| Rendement annualisé | $(1 + r_{cum})^{252/N} - 1$ |
+| Volatilité annualisée | $\sigma_{daily} \times \sqrt{252}$ |
+| Sharpe (rf = 0) | $\frac{r_{ann}}{\sigma_{ann}}$ |
+| Max Drawdown | $\min\left(\frac{NAV_t}{NAV_{peak}} - 1\right)$ |
+| Calmar | $\frac{r_{ann}}{|MaxDD|}$ |
+
+### Métriques croisées sur le portefeuille global
+
+| Métrique | Description |
+|----------|-------------|
+| Bêta global vs Core | Sensibilité du portefeuille au Core seul |
+| Corrélation globale vs Core | Lien linéaire portefeuille / Core |
+| Tracking error | Écart-type annualisé de $r_{global} - r_{core}$ |
+
+### Estimation des frais totaux
+
+Les frais estimés du portefeuille global intègrent :
+- **Frais Core** : TER pondéré des 3 ETFs (en bps)
+- **Frais Satellite** : TER pondéré quotidien des fonds actifs (en bps)
+- **Frais globaux** : $w_{core} \times TER_{core} + w_{sat} \times TER_{sat}$
+
+### Dashboard 6 panneaux
+
+1. NAV cumulée : Core, Satellite, Portefeuille global
+2. Drawdown du portefeuille global
+3. Volatilité rolling 63j du portefeuille
+4. Évolution des poids Core / Satellite dans le temps
+5. Rendements annuels comparés
+6. Frais estimés (Core, Satellite, Global)
+
+---
+
+## 18. Garde-fous anti look-ahead bias
+
+La rigueur **anti look-ahead** est un pilier de ce projet. Voici les mécanismes en place :
+
+### Poids exécutés t−1
+
+Partout dans le pipeline, les **poids à la date t sont ceux déterminés avant t** :
+- Rendement Satellite : $r(t) = \sum w_i(t-1) \times r_i(t)$
+- Rendement global : $r(t) = w_{core}(t-1) \times r_{core}(t) + w_{sat}(t-1) \times r_{sat}(t)$
+- Allocation vol-targeting : les poids décidés en fin de mois s'appliquent au mois suivant
+
+### Fenêtres de calibration : calib_end = review_date − 1
+
+À chaque revue annuelle ou trimestrielle Satellite, la fenêtre de calibration se termine **1 jour avant** la date de décision :
+
+$$calib\_end = review\_date - 1\text{ jour}$$
+
+Ainsi, le rendement du jour de la décision n'est jamais inclus dans l'estimation.
+
+### Score de régime décalé
+
+Le RegimeScore à la date t utilise :
+- Des indicateurs calculés jusqu'à t (inclus)
+- Mais le score lui-même est **shifté de 1 jour** : $RegimeScore(t) = RegimeScore_{raw}(t-1)$
+- Les seuils rolling sont également shiftés
+
+→ La classification de régime au jour t ne dépend que de données ≤ t−1.
+
+### Poids Core calibrés sur l'IS uniquement
+
+Les poids de la stratégie "Efficient Vol 17 %" sont déterminés **une seule fois** sur la fenêtre IS (2019-2020), puis appliqués **fixement** sur toute la période OOS. Aucune recalibration de ces poids n'a lieu en OOS.
+
+### Limites connues
+
+- **Survivorship bias** : le filtre Level 0 utilise des données instantanées (AUM, devise) qui reflètent l'état actuel des fonds, pas nécessairement l'état historique. Un fonds qui n'existait plus en 2021 pourrait être absent de la base sans qu'on le sache.
+- **Snapshot AUM** : l'AUM utilisé est celui de la dernière extraction Bloomberg, pas l'AUM historique à chaque date de décision.
+
+Ces limites sont inhérentes à l'utilisation de données Bloomberg statiques et ne constituent pas un look-ahead bias au sens strict (aucune donnée *future* n'est utilisée), mais plutôt un léger biais de survie.

@@ -2,7 +2,7 @@
 Comparaison des stratégies Core via frontière efficiente (données daily).
 
 Entrée :
-- data/univers_core_etf_eur_daily_wide.xlsx via src.core_pipeline_corrected.load_selected_core_log_returns
+- data/univers_core_etf_eur_daily_wide.xlsx via src.core_data.load_selected_core_log_returns
 
 Fenêtre IS  : 2019-01-01 → 2020-12-31  (calibration, sans look-ahead)
 Fenêtre OOS : 2021-01-01 → 2025-12-31  (évaluation)
@@ -15,14 +15,15 @@ Stratégies comparées (statiques) :
     5. Efficient Vol X% – portefeuilles efficients sous contrainte de vol cible (10% à 20%)
 
 Sorties :
-- outputs/figures/06_efficient_frontier_core.png    (nuage + stratégies statiques)
-- outputs/figures/07_core_strategies_oos_perf.png   (perfs OOS cumulées)
-- outputs/core_portfolio_comparison.csv             (métriques IS + OOS)
+- outputs/figures/06_efficient_frontier_core.png
+- outputs/figures/07_core_strategies_oos_perf.png
+- outputs/core_portfolio_comparison.csv
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -30,10 +31,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import requests
 from scipy.optimize import minimize
 
-from src.core_pipeline_corrected import load_selected_core_log_returns
-from src.risk_free import get_bund_risk_free_daily
+from src.core_data import load_selected_core_log_returns
 
 project_root = Path(__file__).resolve().parent.parent
 
@@ -57,6 +58,54 @@ class FrontierConfig:
 
     target_vols: Tuple[float, ...] = tuple(np.round(np.arange(0.10, 0.201, 0.01), 2))
     dpi:          int   = 160
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Risk-free rate (ex risk_free.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _annual_yield_to_daily_return(y_ann: pd.Series) -> pd.Series:
+    y_ann = pd.to_numeric(y_ann, errors="coerce")
+    return (1.0 + y_ann).pow(1.0 / 252.0) - 1.0
+
+
+def get_bund_risk_free_daily(
+    index: pd.DatetimeIndex,
+    default_annual: float = 0.02,
+    timeout_sec: float = 4.0,
+) -> Tuple[pd.Series, str]:
+    """
+    Daily risk-free series aligned to *index*.
+
+    Priority : FRED CSV (Germany 10Y) → constant fallback.
+    """
+    src = {
+        "name": "FRED IRLTLT01DEM156N",
+        "url": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=IRLTLT01DEM156N",
+        "date_col": "DATE",
+        "value_col": "IRLTLT01DEM156N",
+        "is_percent": True,
+    }
+    try:
+        response = requests.get(src["url"], timeout=timeout_sec)
+        response.raise_for_status()
+        raw = pd.read_csv(StringIO(response.text))
+        if src["date_col"] in raw.columns and src["value_col"] in raw.columns:
+            s = raw[[src["date_col"], src["value_col"]]].copy()
+            s[src["date_col"]] = pd.to_datetime(s[src["date_col"]], errors="coerce")
+            s = s.dropna(subset=[src["date_col"]]).set_index(src["date_col"]).sort_index()
+            y = pd.to_numeric(s[src["value_col"]], errors="coerce")
+            if src["is_percent"]:
+                y = y / 100.0
+            rf_daily = _annual_yield_to_daily_return(y).rename("risk_free")
+            rf_daily = rf_daily.reindex(index).ffill().fillna(0.0)
+            return rf_daily, f"API {src['name']}"
+    except Exception:
+        pass
+
+    daily = (1.0 + default_annual) ** (1.0 / 252.0) - 1.0
+    rf_daily = pd.Series(daily, index=index, name="risk_free")
+    return rf_daily, f"Fallback constant {default_annual:.2%} annual"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -252,13 +301,6 @@ def _opt_target_vol(mu: np.ndarray, cov: np.ndarray, w_min: float, w_max: float,
         return _opt_min_var(mu, cov, w_min, w_max)
     w = np.maximum(res.x, 0)
     return w / w.sum() if w.sum() > 1e-12 else _opt_min_var(mu, cov, w_min, w_max)
-
-
-def _risk_parity(cov: np.ndarray) -> np.ndarray:
-    """Poids inversement proportionnels à la vol individuelle."""
-    vols = np.sqrt(np.diag(cov))
-    inv_vol = 1.0 / (vols + 1e-12)
-    return inv_vol / inv_vol.sum()
 
 
 def _risk_parity_weights(cov: np.ndarray, w_min: float, w_max: float) -> np.ndarray:
