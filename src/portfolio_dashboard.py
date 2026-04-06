@@ -52,7 +52,7 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
     print('=' * 72)
     print(f"Période : {real_returns_input.index.min().date()} → {real_returns_input.index.max().date()}")
     print(f"Nb observations : {len(real_returns_input):,}")
-    print(f"Vol Core 63j (moy): {vol_core_in.mean():.2%} | Vol Sat 63j (moy): {vol_sat_in.mean():.2%}")
+    print(f"Vol Core {lookback}j (moy): {vol_core_in.mean():.2%} | Vol Sat {lookback}j (moy): {vol_sat_in.mean():.2%}")
 
     # Dynamic allocation
     weights_dyn_real, port_ret_real, port_vol_roll_real, rebalance_log_real = (
@@ -201,9 +201,9 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
 
     dd_compare = nav_compare.div(nav_compare.cummax()).sub(1.0)
     vol_compare = pd.concat([
-        global_ret.rolling(63).std() * np.sqrt(252),
-        core_ret.rolling(63).std() * np.sqrt(252),
-        sat_ret.rolling(63).std() * np.sqrt(252),
+        global_ret.rolling(lookback).std() * np.sqrt(252),
+        core_ret.rolling(lookback).std() * np.sqrt(252),
+        sat_ret.rolling(lookback).std() * np.sqrt(252),
     ], axis=1)
     vol_compare.columns = ['Global', 'Core', 'Satellite']
 
@@ -241,7 +241,7 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
     axes[1, 0].plot(vol_compare.index, vol_compare['Satellite'] * 100, lw=1.5, color='#6f42c1',
                     label='Satellite')
     axes[1, 0].axhline(10.0, color='black', ls='--', lw=1.0, label='Cible 10%')
-    axes[1, 0].set_title('Volatilité rolling 63j annualisée')
+    axes[1, 0].set_title(f'Volatilité rolling {lookback}j annualisée')
     axes[1, 0].set_ylabel('%')
     axes[1, 0].grid(True, alpha=0.25)
     axes[1, 0].legend(frameon=False)

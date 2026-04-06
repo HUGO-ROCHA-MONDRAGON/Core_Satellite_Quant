@@ -111,11 +111,25 @@ def _lire_wide_values(path: Path, sheet: str) -> pd.DataFrame:
 
     data = df.iloc[10:].copy()
     data.columns = ["Date"] + tickers[: data.shape[1] - 1]
-    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
-    data = data.dropna(subset=["Date"]).set_index("Date").sort_index()
 
-    for col in data.columns:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
+    value_cols = [col for col in data.columns if col != "Date"]
+    data[value_cols] = data[value_cols].apply(pd.to_numeric, errors="coerce")
+
+    dates = pd.to_datetime(data["Date"], errors="coerce")
+    if dates.notna().sum() <= 1:
+        start_date = pd.to_datetime(df.iloc[3, 1], errors="coerce")
+        non_empty_rows = data[value_cols].notna().any(axis=1)
+        n_rows = int(non_empty_rows.sum())
+        if pd.notna(start_date) and n_rows > 0:
+            rebuilt_dates = pd.bdate_range(start=start_date, periods=n_rows)
+            data = data.loc[non_empty_rows].copy()
+            data["Date"] = rebuilt_dates
+        else:
+            data["Date"] = dates
+    else:
+        data["Date"] = dates
+
+    data = data.dropna(subset=["Date"]).set_index("Date").sort_index()
 
     data = data[[col for col in data.columns if not col.startswith("__col")]]
     data.index.name = "Date"

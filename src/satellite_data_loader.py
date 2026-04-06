@@ -111,12 +111,15 @@ def preprocess_prices(
         print(f"❌ Aucune donnée dans la période {start_date} à {end_date}")
         return pd.DataFrame(), []
     
-    print(f"\n📊 Prétraitement des prix (2019-2020):")
+    print(f"\n📊 Prétraitement des prix ({start_date[:4]}-{end_date[:4]}):")
     print(f"   Période: {df_period.index[0].date()} à {df_period.index[-1].date()}")
     print(f"   Observations: {len(df_period)}")
     
-    # Forward fill limité
-    df_ffilled = df_period.fillna(method='ffill', limit=ffill_limit)
+    # Forward fill limité (skip si ffill_limit <= 0)
+    if ffill_limit and ffill_limit > 0:
+        df_ffilled = df_period.fillna(method='ffill', limit=ffill_limit)
+    else:
+        df_ffilled = df_period
     
     # Compter les observations
     n_obs_per_ticker = df_ffilled.notna().sum()
@@ -156,8 +159,11 @@ def align_prices_with_core(
     - Intersection des dates
     - Retourne (df_aligned_prices, core_aligned_returns)
     """
-    # FFill des prix satellite
-    df_ffilled = df_prices.fillna(method='ffill', limit=ffill_limit)
+    # FFill des prix satellite (skip si ffill_limit <= 0)
+    if ffill_limit and ffill_limit > 0:
+        df_ffilled = df_prices.fillna(method='ffill', limit=ffill_limit)
+    else:
+        df_ffilled = df_prices
     
     # Intersection des dates
     common_dates = df_ffilled.index.intersection(core_returns.index)

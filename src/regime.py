@@ -59,15 +59,30 @@ def build_regime(daily_returns_df, core_tickers, core_equity, core_rates,
     base_full["corr_eq_bond_63"] = base_full["equity_ret"].rolling(win, min_periods=win).corr(base_full["bonds_ret"])
     base_full["mom_63"] = (1.0 + base_full["core_ret"]).rolling(win, min_periods=win).apply(np.prod, raw=True) - 1.0
 
+    # Drawdown indicator
+    nav = (1.0 + base_full["core_ret"]).cumprod()
+    rolling_peak = nav.rolling(win, min_periods=win).max()
+    base_full["dd_63"] = nav / rolling_peak - 1.0
+
     # Z-scores
     z_win = int(regime_cfg["zscore_window_days"])
     min_p = int(regime_cfg["zscore_min_periods"])
     base_full["vol_z"] = rolling_zscore(base_full["vol_63"], z_win=z_win, min_p=min_p)
     base_full["corr_z"] = rolling_zscore(base_full["corr_eq_bond_63"], z_win=z_win, min_p=min_p)
     base_full["mom_z"] = rolling_zscore(base_full["mom_63"], z_win=z_win, min_p=min_p)
+    base_full["dd_z"] = rolling_zscore(base_full["dd_63"], z_win=z_win, min_p=min_p)
 
-    # Score causal
-    base_full["RegimeScore_raw"] = base_full["vol_z"] + base_full["corr_z"] - base_full["mom_z"]
+    # Weighted score causal (component weights from regime_cfg)
+    w_vol = float(regime_cfg.get("w_vol", 0.45))
+    w_corr = float(regime_cfg.get("w_corr", 0.15))
+    w_mom = float(regime_cfg.get("w_mom", 0.40))
+    w_dd = float(regime_cfg.get("w_dd", 0.20))
+    base_full["RegimeScore_raw"] = (
+        w_vol * base_full["vol_z"]
+        + w_corr * base_full["corr_z"]
+        - w_mom * base_full["mom_z"]
+        - w_dd * base_full["dd_z"]
+    )
     base_full["RegimeScore"] = base_full["RegimeScore_raw"].shift(1)
 
     # Rolling thresholds
@@ -110,7 +125,7 @@ def build_regime(daily_returns_df, core_tickers, core_equity, core_rates,
     first_oos = base_df.index.min()
 
     # Regime output
-    regime_output = base_df[["RegimeScore", "Regime", "q_low_roll", "q_high_roll", "vol_63", "corr_eq_bond_63", "mom_63"]].copy()
+    regime_output = base_df[["RegimeScore", "Regime", "q_low_roll", "q_high_roll", "vol_63", "corr_eq_bond_63", "mom_63", "dd_63"]].copy()
 
     # Stats per regime
     stats_rows = []
@@ -128,7 +143,7 @@ def build_regime(daily_returns_df, core_tickers, core_equity, core_rates,
     regime_stats_df = pd.DataFrame(stats_rows).set_index("Regime")
 
     # Coherence
-    coherence_df = base_df.groupby("Regime")[["vol_63", "mom_63", "corr_eq_bond_63"]].mean()
+    coherence_df = base_df.groupby("Regime")[["vol_63", "mom_63", "corr_eq_bond_63", "dd_63"]].mean()
     coherence_df = coherence_df.reindex(["Stress", "Neutre", "Risk-on"])
 
     return {
@@ -290,11 +305,16 @@ def optimize_regime_cfg(daily_returns_df, core_tickers, core_equity, core_rates,
 
     # Grid
     indicator_window_months_grid = [2, 3, 4]
-    zscore_window_months_grid = [9, 12, 15, 18]
+    zscore_window_months_grid = [9, 12, 15, 18, 21, 24]
     zscore_min_frac_grid = [0.45, 0.50, 0.60]
     rolling_threshold_months_grid = [18, 24, 30]
-    quantile_pairs_grid = [(0.25, 0.75), (0.30, 0.70), (0.35, 0.65)]
+    quantile_pairs_grid = [(0.25, 0.75), (0.30, 0.70), (0.35, 0.65), (0.25, 0.80)]
     min_regime_days_grid = [7, 10, 14]
+    score_weights_grid = [
+        (0.45, 0.15, 0.40, 0.20),  # default: vol-led, low corr
+        (0.35, 0.20, 0.35, 0.20),  # balanced
+        (0.40, 0.10, 0.30, 0.30),  # drawdown-led
+    ]
 
     combos = list(product(
         indicator_window_months_grid,
@@ -303,12 +323,14 @@ def optimize_regime_cfg(daily_returns_df, core_tickers, core_equity, core_rates,
         rolling_threshold_months_grid,
         quantile_pairs_grid,
         min_regime_days_grid,
+        score_weights_grid,
     ))
 
     results = []
 
-    for ind_m, z_m, z_frac, thr_m, q_pair, min_days in combos:
+    for ind_m, z_m, z_frac, thr_m, q_pair, min_days, sw in combos:
         low_q, high_q = q_pair
+        w_vol, w_corr, w_mom, w_dd = sw
         ind_win = months_to_days(ind_m)
         z_win = months_to_days(z_m)
         thr_win = months_to_days(thr_m)
@@ -321,11 +343,21 @@ def optimize_regime_cfg(daily_returns_df, core_tickers, core_equity, core_rates,
         df["corr_eq_bond_63"] = df["equity_ret"].rolling(ind_win, min_periods=ind_win).corr(df["bonds_ret"])
         df["mom_63"] = (1.0 + df["core_ret"]).rolling(ind_win, min_periods=ind_win).apply(np.prod, raw=True) - 1.0
 
+        nav = (1.0 + df["core_ret"]).cumprod()
+        rolling_peak = nav.rolling(ind_win, min_periods=ind_win).max()
+        df["dd_63"] = nav / rolling_peak - 1.0
+
         df["vol_z"] = rolling_zscore(df["vol_63"], z_win=z_win, min_p=min_p)
         df["corr_z"] = rolling_zscore(df["corr_eq_bond_63"], z_win=z_win, min_p=min_p)
         df["mom_z"] = rolling_zscore(df["mom_63"], z_win=z_win, min_p=min_p)
+        df["dd_z"] = rolling_zscore(df["dd_63"], z_win=z_win, min_p=min_p)
 
-        df["RegimeScore_raw"] = df["vol_z"] + df["corr_z"] - df["mom_z"]
+        df["RegimeScore_raw"] = (
+            w_vol * df["vol_z"]
+            + w_corr * df["corr_z"]
+            - w_mom * df["mom_z"]
+            - w_dd * df["dd_z"]
+        )
         df["RegimeScore"] = df["RegimeScore_raw"].shift(1)
 
         is_scores = df.loc[is_mask_global, "RegimeScore_raw"].dropna()
@@ -361,6 +393,10 @@ def optimize_regime_cfg(daily_returns_df, core_tickers, core_equity, core_rates,
             "threshold_low_q": low_q,
             "threshold_high_q": high_q,
             "min_regime_days": min_days,
+            "w_vol": w_vol,
+            "w_corr": w_corr,
+            "w_mom": w_mom,
+            "w_dd": w_dd,
             "score_is": met_is["score"],
             "score_oos": met_oos["score"],
             "score_global": global_score,
@@ -391,6 +427,10 @@ def optimize_regime_cfg(daily_returns_df, core_tickers, core_equity, core_rates,
         "is_end": fixed_is_end,
         "oos_start": fixed_oos_start,
         "min_regime_days": int(best["min_regime_days"]),
+        "w_vol": float(best["w_vol"]),
+        "w_corr": float(best["w_corr"]),
+        "w_mom": float(best["w_mom"]),
+        "w_dd": float(best["w_dd"]),
     }
 
     elapsed = time.perf_counter() - t0
@@ -421,13 +461,22 @@ def display_regime_results(regime_result, regime_cfg):
     low_q = float(regime_cfg['threshold_low_q'])
     high_q = float(regime_cfg['threshold_high_q'])
 
+    w_vol = regime_cfg.get('w_vol', 1.0)
+    w_corr = regime_cfg.get('w_corr', 1.0)
+    w_mom = regime_cfg.get('w_mom', 1.0)
+    w_dd = regime_cfg.get('w_dd', 0.0)
+
     print("\n" + "=" * 80)
-    print("REGIMES DE MARCHE CORE (Vol / Corr / Momentum)")
+    print("REGIMES DE MARCHE CORE (Vol / Corr / Momentum / Drawdown)")
     print("=" * 80)
     print(
         f"Parametres regime: win={regime_cfg['indicator_window_days']}j, "
         f"q=({low_q:.0%},{high_q:.0%}), "
         f"roll_thr={regime_cfg['rolling_threshold_days']}j, min_regime={regime_cfg['min_regime_days']}j"
+    )
+    print(
+        f"Poids score: w_vol={w_vol:.2f}, w_corr={w_corr:.2f}, "
+        f"w_mom={w_mom:.2f}, w_dd={w_dd:.2f}"
     )
     print(f"\nPeriode utilisee (IS+OOS): {base_full.index.min().date()} -> {base_full.index.max().date()} ({len(base_full)} obs)")
     print(f"Calibration IS ({regime_cfg['is_start']} -> {regime_cfg['is_end']})")
@@ -448,10 +497,13 @@ def display_regime_results(regime_result, regime_cfg):
     }))
 
     print("\nVerification coherence economique (moyennes indicateurs) :")
-    _display(coherence_df.style.format({
+    fmt_coherence = {
         'vol_63': '{:.2%}', 'mom_63': '{:+.2%}', 'corr_eq_bond_63': '{:+.3f}',
-    }))
-    print("Attendu: Stress = vol haute & momentum negatif; Risk-on = vol basse & momentum positif.")
+    }
+    if 'dd_63' in coherence_df.columns:
+        fmt_coherence['dd_63'] = '{:+.2%}'
+    _display(coherence_df.style.format(fmt_coherence))
+    print("Attendu: Stress = vol haute & momentum negatif & drawdown negatif; Risk-on = vol basse & momentum positif & drawdown ~0.")
 
 
 def display_regime_optimization(res_df, best_regime_cfg, best):
@@ -465,6 +517,7 @@ def display_regime_optimization(res_df, best_regime_cfg, best):
     cols_show = [
         'indicator_window_months', 'zscore_window_months', 'rolling_threshold_months',
         'zscore_min_periods', 'threshold_low_q', 'threshold_high_q', 'min_regime_days',
+        'w_vol', 'w_corr', 'w_mom', 'w_dd',
         'score_is', 'score_oos', 'score_global', 'ret_order_oos', 'vol_order_oos',
         'stress_capture_oos', 'riskon_capture_oos', 'switches_per_year_oos'
     ]

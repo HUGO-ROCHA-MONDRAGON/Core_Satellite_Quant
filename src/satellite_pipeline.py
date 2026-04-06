@@ -7,7 +7,8 @@ from pathlib import Path
 from src.satellite_filters import (
     filter_satellite_level0,
     apply_level1_filter_corrected,
-    apply_level2_alpha_expense,
+    _resolve_expense_col,
+    _parse_expense_series,
 )
 from src.satellite_data_loader import (
     load_all_satellite_prices,
@@ -39,14 +40,51 @@ def _extract_tickers_from_price_sheet(price_file, sheet_name):
 
 
 def _build_banned_tickers_by_sheet(cfg, data_dir="data"):
-    banned_sheets = cfg.get("bans", {}).get("strat3_banned_sheet_names", [])
-    if not banned_sheets:
-        return set()
-    price_file = Path(data_dir) / "STRAT3_price.xlsx"
-    banned_tickers = set()
-    for sh in banned_sheets:
-        banned_tickers |= _extract_tickers_from_price_sheet(price_file, sh)
+    bans = cfg.get("bans", {})
+    banned_sheets = bans.get("strat3_banned_sheet_names", [])
+    # Individual ticker ban list (overrides sheet-level bans for fine-grained control)
+    banned_tickers = set(str(t).strip() for t in bans.get("strat3_banned_tickers", []))
+    if banned_sheets:
+        price_file = Path(data_dir) / "STRAT3_price.xlsx"
+        for sh in banned_sheets:
+            banned_tickers |= _extract_tickers_from_price_sheet(price_file, sh)
     return banned_tickers
+
+
+def _build_pool_from_level1(df_l1, prices_win, cfg):
+    """Structural pool filter on L1 survivors: TER hard cap + min price obs. No scoring."""
+    ticker_col = detect_ticker_col(df_l1)
+    l2_cfg = cfg.get("level2", {})
+    max_ter = float(l2_cfg.get("max_ter_pct", 2.0))
+    min_obs = int(l2_cfg.get("min_obs_pool", 60))
+    expense_col_name = l2_cfg.get("expense_col", "expense_pct")
+
+    try:
+        resolved_col = _resolve_expense_col(df_l1, expense_col_name)
+        expense_series = _parse_expense_series(df_l1.set_index(ticker_col)[resolved_col])
+    except (ValueError, KeyError):
+        expense_series = pd.Series(dtype=float)
+
+    rows = []
+    for _, row in df_l1.iterrows():
+        t = str(row[ticker_col]).strip()
+        strat = row["Strat"]
+
+        if t not in prices_win.columns:
+            continue
+        n_obs = int(prices_win[t].dropna().shape[0])
+        if n_obs < min_obs:
+            continue
+
+        expense = expense_series.get(t, np.nan)
+        if pd.notna(expense) and expense > max_ter:
+            continue
+
+        rows.append({"ticker": t, "Strat": strat, "expense_pct": expense, "n_obs_pool": n_obs})
+
+    if not rows:
+        return pd.DataFrame(columns=["ticker", "Strat", "expense_pct", "n_obs_pool"])
+    return pd.DataFrame(rows)
 
 
 def _resolve_core_benchmark_returns(core_3_log, params, core_benchmark_returns=None):
@@ -92,6 +130,39 @@ def _resolve_core_benchmark_returns(core_3_log, params, core_benchmark_returns=N
 
 # ── Scoring ──────────────────────────────────────────────────────────────────
 
+def _is_fund_dead(px_series, window_end, min_recency_pct=0.20):
+    """Return True if the fund has no valid price in the last min_recency_pct of the window."""
+    if px_series.empty:
+        return True
+    last_valid = px_series.last_valid_index()
+    if last_valid is None:
+        return True
+    n = len(px_series)
+    recency_cutoff = px_series.index[max(0, int(n * (1.0 - min_recency_pct)))]
+    return last_valid < recency_cutoff
+
+
+def _ewm_ann_return(rets, halflife):
+    """EWM-weighted annualized return."""
+    w = _ewm_weights(len(rets), halflife)
+    return float(np.sum(w * rets.values)) * 252
+
+
+def _ewm_ann_vol(rets, halflife):
+    """EWM-weighted annualized volatility."""
+    w = _ewm_weights(len(rets), halflife)
+    mu = float(np.sum(w * rets.values))
+    var = float(np.sum(w * (rets.values - mu) ** 2))
+    return np.sqrt(max(var, 0.0)) * np.sqrt(252)
+
+
+def _ewm_weights(n, halflife):
+    """Normalized exponential weights, most recent = highest."""
+    alpha = 1.0 - np.exp(-np.log(2) / halflife)
+    raw = np.array([(1.0 - alpha) ** i for i in range(n - 1, -1, -1)])
+    return raw / raw.sum()
+
+
 def _score_pool_by_bloc_formulas(pool_scores, prices_win, core_win, cfg):
     if pool_scores.empty:
         return pool_scores
@@ -115,20 +186,40 @@ def _score_pool_by_bloc_formulas(pool_scores, prices_win, core_win, cfg):
 
     stress_q = float(cfg["level2"].get("stress_quantile", 0.20))
     stress_days = core_s[core_s <= core_s.quantile(stress_q)].index
-    min_obs = int(cfg["level2"].get("min_obs_alpha", 60))
+    min_obs = int(cfg["level2"].get("min_obs_score", cfg["level2"].get("min_obs_alpha", 60)))
+    halflife = int(cfg["level2"].get("score_halflife_days", 63))  # ~3 mois par défaut
+
+    window_end = prices_win.index[-1] if len(prices_win) > 0 else None
 
     metrics_rows = []
+    dead_tickers = set()
     for t in out["ticker"].dropna().unique():
         if t not in prices_win.columns:
             continue
-        px = pd.to_numeric(prices_win[t], errors="coerce").dropna()
+
+        px_raw = pd.to_numeric(prices_win[t], errors="coerce")
+
+        # --- Dead fund detection: no valid price in last 20% of window ---
+        if _is_fund_dead(px_raw, window_end):
+            dead_tickers.add(t)
+            continue
+
+        px = px_raw.dropna()
         fund_ret = np.log(px).diff().dropna()
         aligned = pd.concat([fund_ret.rename("fund"), core_s.rename("core")], axis=1).dropna()
         if len(aligned) < min_obs:
             continue
 
-        core_var = aligned["core"].var()
-        beta = aligned["fund"].cov(aligned["core"]) / core_var if pd.notna(core_var) and core_var > 0 else np.nan
+        f = aligned["fund"]
+        c = aligned["core"]
+
+        # --- EWM-weighted metrics (recent observations count more) ---
+        ret_ann = _ewm_ann_return(f, halflife)
+        vol = _ewm_ann_vol(f, halflife)
+        core_ret_ann = _ewm_ann_return(c, halflife)
+
+        core_var = c.var()
+        beta = f.cov(c) / core_var if pd.notna(core_var) and core_var > 0 else np.nan
 
         beta_stress = np.nan
         stress_aligned = aligned.loc[aligned.index.intersection(stress_days)]
@@ -138,17 +229,20 @@ def _score_pool_by_bloc_formulas(pool_scores, prices_win, core_win, cfg):
                 beta_stress = stress_aligned["fund"].cov(stress_aligned["core"]) / core_var_stress
 
         beta_bloc1 = beta_stress if pd.notna(beta_stress) else beta
-        corr = aligned["fund"].corr(aligned["core"])
-        ret_ann = ann_return(aligned["fund"])
-        vol = ann_vol(aligned["fund"])
+        corr = f.corr(c)
         sharpe = ret_ann / vol if pd.notna(ret_ann) and pd.notna(vol) and vol > 0 else np.nan
-        sortino = sortino0(aligned["fund"])
-        maxdd = maxdd_abs(aligned["fund"])
-        skewness = aligned["fund"].skew()
-        kurtosis = aligned["fund"].kurt()
+        sortino = sortino0(f)
+        maxdd = maxdd_abs(f)
+        skewness = f.skew()
+        kurtosis = f.kurt()
 
-        core_ret_ann = ann_return(aligned["core"])
         alpha = ret_ann - beta * core_ret_ann if pd.notna(ret_ann) and pd.notna(beta) and pd.notna(core_ret_ann) else np.nan
+
+        # Information ratio = annualized active return / tracking error
+        active_rets = f - c
+        te = active_rets.std() * np.sqrt(252)
+        active_ann = active_rets.mean() * 252
+        info_ratio = active_ann / te if pd.notna(te) and te > 1e-12 else np.nan
 
         rs = aligned.loc[aligned.index.intersection(stress_days), "fund"]
         return_stress = ann_return(rs) if len(rs) > 0 else np.nan
@@ -157,7 +251,7 @@ def _score_pool_by_bloc_formulas(pool_scores, prices_win, core_win, cfg):
             "ticker": t, "beta": beta, "beta_stress": beta_stress, "beta_bloc1": beta_bloc1,
             "corr": corr, "return_stress": return_stress, "skewness": skewness, "maxdd_abs": maxdd,
             "alpha_annual": alpha, "sharpe": sharpe, "sortino": sortino, "vol": vol,
-            "ret_ann": ret_ann, "kurtosis": kurtosis,
+            "ret_ann": ret_ann, "kurtosis": kurtosis, "info_ratio": info_ratio,
         })
 
     if not metrics_rows:
@@ -179,33 +273,60 @@ def _score_pool_by_bloc_formulas(pool_scores, prices_win, core_win, cfg):
         su = str(strat).upper()
 
         z_beta_b1 = safe_zscore(g["beta_bloc1"].abs())
-        z_corr = safe_zscore(g["corr"])
         z_corr_abs = safe_zscore(g["corr"].abs())
         z_stress = safe_zscore(g["return_stress"])
         z_skew = safe_zscore(g["skewness"])
         z_mdd = safe_zscore(g["maxdd_abs"])
         z_alpha = safe_zscore(g["alpha_annual"])
-        z_expense = safe_zscore(-pd.to_numeric(g.get("expense_pct"), errors="coerce"))
-        z_sh = safe_zscore(g["sharpe"])
         z_so = safe_zscore(g["sortino"])
-        z_vol = safe_zscore(g["vol"])
         z_ret = safe_zscore(g["ret_ann"])
         z_kurt = safe_zscore(g["kurtosis"])
+        z_info = safe_zscore(g["info_ratio"])
 
         if su == "STRAT1":
-            g["score_custom"] = -0.40 * z_beta_b1 - 0.20 * z_corr_abs + 0.20 * z_stress + 0.15 * z_sh - 0.15 * z_mdd
+            # Couverture / Tail Risk : decorrelation + stress protection
+            g["score_custom"] = (
+                -0.35 * z_beta_b1
+                - 0.25 * z_corr_abs
+                + 0.20 * z_stress
+                + 0.10 * z_so
+                - 0.10 * z_mdd
+            )
         elif su == "STRAT2":
-            g["score_custom"] = 0.60 * z_alpha + 0.30 * z_expense + 0.10 * z_sh - 0.05 * z_corr_abs
+            # Alpha / Valeur Relative : alpha + info ratio + risk-adjusted
+            g["score_custom"] = (
+                0.40 * z_alpha
+                + 0.25 * z_info
+                + 0.20 * z_so
+                - 0.10 * z_corr_abs
+                - 0.05 * z_mdd
+            )
         elif su == "STRAT3":
-            g["score_custom"] = 0.55 * z_alpha + 0.35 * z_expense + 0.10 * z_ret - 0.05 * z_kurt
+            # Alternatives / Cat Bonds : carry + decorrelation + tail profile
+            g["score_custom"] = (
+                0.30 * z_ret
+                + 0.25 * z_alpha
+                - 0.20 * z_corr_abs
+                + 0.15 * z_skew
+                - 0.10 * z_kurt
+            )
         else:
             g["score_custom"] = np.nan
 
-        g["score_level2"] = g["score_custom"].combine_first(pd.to_numeric(g.get("score_level2"), errors="coerce"))
+        if "score_level2" in g.columns:
+            g["score_level2"] = g["score_custom"].combine_first(pd.to_numeric(g["score_level2"], errors="coerce"))
+        else:
+            g["score_level2"] = g["score_custom"]
         parts.append(g)
 
     out = pd.concat(parts, ignore_index=True)
     out = out.drop(columns=[c for c in out.columns if c.endswith("_new")])
+
+    # --- Dead funds → score = -1000 (ensures natural replacement) ---
+    if dead_tickers:
+        dead_mask = out["ticker"].isin(dead_tickers)
+        out.loc[dead_mask, "score_level2"] = -1000.0
+        out.loc[dead_mask, "score_custom"] = -1000.0
     return out
 
 
@@ -300,43 +421,33 @@ def _annual_pool_at_date(review_date, df_level0, prices_all_aligned, core_all_al
             res_l1["calib_end"] = calib_end
         return pd.DataFrame(), res_l1, calib_start, calib_end
 
-    l2 = cfg["level2"]
-    df_l2, res_l2 = apply_level2_alpha_expense(
-        df_l1, prices_win, core_win,
-        calib_start=calib_start.strftime("%Y-%m-%d"),
-        calib_end=calib_end.strftime("%Y-%m-%d"),
-        expense_col=l2["expense_col"],
-        alpha_weight=l2["alpha_weight"],
-        expense_weight=l2["expense_weight"],
-        min_obs_alpha=l2["min_obs_alpha"],
-        keep_top_per_strat=l2["keep_top_per_strat"],
-        verbose=False,
-    )
-
-    if res_l2.empty:
+    # Structural pool filter (TER cap + min obs) — replaces L2 scoring as gating
+    pool_df = _build_pool_from_level1(df_l1, prices_win, cfg)
+    if pool_df.empty:
         return pd.DataFrame(), pd.DataFrame(), calib_start, calib_end
 
-    scored = _score_pool_by_bloc_formulas(res_l2.copy(), prices_win, core_win, cfg)
-    keep_n = int(l2.get("keep_top_per_strat", 7))
-    df_l2_custom = (
-        scored.sort_values(["Strat", "score_level2"], ascending=[True, False])
-        .groupby("Strat", group_keys=False)
-        .head(keep_n)
-        .copy()
-    )
+    # Compute bloc scores for display/tracking (pool is NOT gated by score)
+    scored = _score_pool_by_bloc_formulas(pool_df.copy(), prices_win, core_win, cfg)
 
-    for df_ in (scored, df_l2_custom):
-        df_["review_date"] = pd.Timestamp(review_date)
-        df_["calib_start"] = calib_start
-        df_["calib_end"] = calib_end
+    scored["review_date"] = pd.Timestamp(review_date)
+    scored["calib_start"] = calib_start
+    scored["calib_end"] = calib_end
 
-    return df_l2_custom, scored, calib_start, calib_end
+    return scored, scored, calib_start, calib_end
 
 
 def _quarterly_review_dates(prices_idx, cfg):
     start = pd.Timestamp(cfg["rolling"]["oos_start"]).normalize()
     end = pd.Timestamp(cfg["rolling"]["oos_end"]).normalize()
-    raw_q = pd.date_range(start=start, end=end, freq=cfg["rolling"]["quarterly_freq"])
+
+    # Support review_freq_months (integer) or quarterly_freq (pandas offset string)
+    freq_months = cfg["rolling"].get("review_freq_months")
+    if freq_months is not None:
+        freq = f"{int(freq_months)}MS"
+    else:
+        freq = cfg["rolling"]["quarterly_freq"]
+
+    raw_q = pd.date_range(start=start, end=end, freq=freq)
 
     q_dates = []
     for d in raw_q:
@@ -368,11 +479,12 @@ def _pick_from_pool_for_quarter(pool_scores, prices_all_aligned, core_all_aligne
     win_start = win_end - pd.DateOffset(years=cfg["rolling"]["lookback_years_for_score"]) + pd.Timedelta(days=1)
     prices_win = prices_all_aligned.loc[win_start:win_end]
 
-    pool_eff = pool_scores.copy()
-    if bool(cfg["rolling"].get("quarterly_rescore_pool_1y", False)):
-        pool_eff = _rescore_pool_quarterly(pool_eff, prices_all_aligned, core_all_aligned, qdate, cfg)
+    # Always rescore with fresh lookback — this is the sole scoring for selection
+    pool_eff = _rescore_pool_quarterly(pool_scores.copy(), prices_all_aligned, core_all_aligned, qdate, cfg)
 
     rows = []
+    # Build a simple (strat, ticker) -> score dict for fast lookup in switching logic
+    fresh_scores_dict = {}  # (strat_str, ticker_str) -> float score
     for strat, g in _safe_strat_group(pool_eff):
         picks = _pick_ranked_for_strat(g, prices_win, p)
         for r in picks:
@@ -382,10 +494,19 @@ def _pick_from_pool_for_quarter(pool_scores, prices_all_aligned, core_all_aligne
                 "score_level2": r["score_level2"], "selected_reason": r["selected_reason"],
                 "pair_corr": r["pair_corr"], "score_gap_vs_top1": r["score_gap_vs_top1"],
             })
-    return pd.DataFrame(rows)
+        # Capture ALL fund scores (not just picked ones) for held-fund freshness lookup
+        tc = detect_ticker_col(g) if not g.empty else None
+        if tc is not None:
+            for _, row in g.iterrows():
+                s = float(row.get("score_level2", np.nan))
+                if not np.isnan(s):
+                    fresh_scores_dict[(str(strat), str(row[tc]))] = s
+    # Return top picks AND score dict (avoids DataFrame key/type issues in switching logic)
+    return pd.DataFrame(rows), fresh_scores_dict
 
 
-def _apply_quarterly_switching(all_quarter_candidates, cfg):
+def _apply_quarterly_switching(all_quarter_candidates, cfg, pool_scores_by_quarter=None):
+    """pool_scores_by_quarter: dict[pd.Timestamp -> dict[(strat_str, ticker_str) -> float]]"""
     if all_quarter_candidates.empty:
         return all_quarter_candidates
 
@@ -397,6 +518,8 @@ def _apply_quarterly_switching(all_quarter_candidates, cfg):
         held_by_rank = {}
 
         for qd, gq in g.groupby("quarter_date"):
+            # Normalize to pd.Timestamp to guarantee dict key match
+            qd_ts = pd.Timestamp(qd)
             q_rows = []
             for rank in sorted(gq["rank_in_strat"].unique()):
                 cand = gq[gq["rank_in_strat"] == rank].sort_values("score_level2", ascending=False).iloc[0].to_dict()
@@ -412,17 +535,25 @@ def _apply_quarterly_switching(all_quarter_candidates, cfg):
                     held_score = float(held.get("score_level2", np.nan))
                     cand_score = float(cand.get("score_level2", np.nan))
 
+                    # Look up held fund's CURRENT score from fresh pool rescore dict
+                    # Uses simple (strat, ticker) tuple key — avoids DataFrame type issues
+                    fresh_held_score = held_score  # fallback to stale if not found
+                    if pool_scores_by_quarter is not None and qd_ts in pool_scores_by_quarter:
+                        score_map = pool_scores_by_quarter[qd_ts]
+                        fresh_held_score = score_map.get((str(strat), str(held_ticker)), held_score)
+
                     if held_ticker == cand_ticker:
                         chosen = cand
                         chosen["switch_flag"] = 0
                         chosen["switch_reason"] = "same_ticker"
-                    elif cand_score >= held_score + switch_buffer:
+                    elif cand_score >= fresh_held_score + switch_buffer:
                         chosen = cand
                         chosen["switch_flag"] = 1
                         chosen["switch_reason"] = "better_score"
                     else:
                         chosen = held.copy()
                         chosen["quarter_date"] = qd
+                        chosen["score_level2"] = fresh_held_score  # update with fresh score
                         chosen["switch_flag"] = 0
                         chosen["switch_reason"] = "hold_buffer"
 
@@ -514,7 +645,13 @@ def run_satellite_pipeline(core_3_log, params, core_benchmark_returns=None):
     all_idx = df_satellite_prices_aligned.index.sort_values()
     annual_dates = _build_annual_review_dates(all_idx, params)
     quarter_dates = _quarterly_review_dates(all_idx, params)
-    print(f"Revue annuelle: {len(annual_dates)} dates | Revue trimestrielle: {len(quarter_dates)} dates")
+
+    # Label dynamique selon la fréquence de revue
+    _freq_k = params["rolling"].get("review_freq_months")
+    _freq_labels = {1: "mensuel", 2: "bimestriel", 3: "trimestriel", 6: "semestriel", 12: "annuel"}
+    _freq_label = _freq_labels.get(_freq_k, f"{_freq_k}-mensuel") if _freq_k else "trimestriel"
+
+    print(f"Revue annuelle: {len(annual_dates)} dates | Revue {_freq_label}: {len(quarter_dates)} dates")
 
     print("\n[Etape 3 glissante] Construction du pool annuel")
     annual_pool_rows = []
@@ -547,9 +684,10 @@ def run_satellite_pipeline(core_3_log, params, core_benchmark_returns=None):
     annual_pool_top = pd.concat(annual_top_rows, ignore_index=True) if annual_top_rows else pd.DataFrame()
     print(f"Pools annuels construits: {annual_pool_top['review_date'].nunique() if not annual_pool_top.empty else 0}")
 
-    # Quarterly selection with switching
-    print("\n[Etape 3 glissante] Selection trimestrielle avec switching")
+    # Periodic selection with switching
+    print(f"\n[Etape 3 glissante] Selection {_freq_label} avec switching")
     quarter_candidate_rows = []
+    pool_scores_by_quarter = {}  # qd -> full rescored pool (for fresh held-fund score lookup)
 
     for qd in quarter_dates:
         if annual_pool_top.empty or annual_pool_scores.empty or "review_date" not in annual_pool_scores.columns:
@@ -562,13 +700,15 @@ def run_satellite_pipeline(core_3_log, params, core_benchmark_returns=None):
         pool_q = annual_pool_scores[annual_pool_scores["review_date"] == pd.Timestamp(active_review)].copy()
         if pool_q.empty:
             continue
-        q_candidates = _pick_from_pool_for_quarter(pool_q, df_satellite_prices_aligned, core_returns_aligned, qd, params)
+        q_candidates, fresh_scores_dict = _pick_from_pool_for_quarter(pool_q, df_satellite_prices_aligned, core_returns_aligned, qd, params)
+        pool_scores_by_quarter[pd.Timestamp(qd)] = fresh_scores_dict
         if not q_candidates.empty:
             q_candidates["active_review_date"] = pd.Timestamp(active_review)
             quarter_candidate_rows.append(q_candidates)
 
     quarter_candidates = pd.concat(quarter_candidate_rows, ignore_index=True) if quarter_candidate_rows else pd.DataFrame()
-    quarter_selection_df = _apply_quarterly_switching(quarter_candidates, params) if not quarter_candidates.empty else pd.DataFrame()
+    # pool_scores_by_quarter: dict[pd.Timestamp -> dict[(strat,ticker)->score]]
+    quarter_selection_df = _apply_quarterly_switching(quarter_candidates, params, pool_scores_by_quarter=pool_scores_by_quarter) if not quarter_candidates.empty else pd.DataFrame()
 
     # Final selection
     if not quarter_selection_df.empty:
@@ -595,9 +735,9 @@ def run_satellite_pipeline(core_3_log, params, core_benchmark_returns=None):
     print(f"\n[Etape 3 glissante] Termine")
     print(f"  - N0 initial: {len(df_satellite_level0)}")
     print(f"  - Reviews annuelles: {len(annual_dates)}")
-    print(f"  - Trimestres evalues: {len(quarter_dates)}")
+    print(f"  - Periodes evaluees ({_freq_label}): {len(quarter_dates)}")
     print(f"  - Lignes pool annuel (scores): {len(annual_pool_scores)}")
-    print(f"  - Lignes selection trimestrielle: {len(quarter_selection_df)}")
+    print(f"  - Lignes selection {_freq_label}: {len(quarter_selection_df)}")
     if pd.notna(latest_q):
         print(f"  - Derniere selection active ({latest_q.date()}): {len(final_selection_df)} lignes")
     else:
@@ -638,10 +778,16 @@ def display_pool_scores(annual_pool_scores):
         _display(annual_pool_scores.tail(30))
 
 
-def display_satellite_selection(results_level2, quarter_selection_df, satellite_final_selection):
-    """Display L2 shortlist, full quarterly history, and final snapshot."""
+def display_satellite_selection(results_level2, quarter_selection_df, satellite_final_selection, review_freq_months=3):
+    """Display L2 shortlist, full periodic selection history, and final snapshot."""
     from IPython.display import display as _display
     import pandas as pd
+
+    # Label dynamique selon la fréquence
+    _freq_labels = {1: "mensuel", 2: "bimestriel", 3: "trimestriel", 6: "semestriel", 12: "annuel"}
+    _freq_label = _freq_labels.get(review_freq_months, f"{review_freq_months}-mensuel")
+    # Offset pandas pour groupby (ex: 1 mois = 'M', 3 mois = 'Q')
+    _period_freq = 'M' if review_freq_months == 1 else ('Q' if review_freq_months == 3 else f"{review_freq_months}ME")
 
     # 1) Score niveau 2
     lvl2 = results_level2.copy() if isinstance(results_level2, pd.DataFrame) and not results_level2.empty else None
@@ -675,9 +821,12 @@ def display_satellite_selection(results_level2, quarter_selection_df, satellite_
         'Dev', 'Ratio des dépenses', 'Total actifs USD (M)'
     ] if c in sel_hist.columns]
 
+    # dynamique: compte les périodes selon la fréquence
+    n_periods = sel_hist['quarter_date'].dt.to_period('M').nunique() if review_freq_months == 1 else sel_hist['quarter_date'].dt.to_period('Q').nunique()
+    period_noun = "période" + ("s" if n_periods > 1 else "")
     print(
-        f"\n🗂️ Historique complet des sélections trimestrielles: "
-        f"{sel_hist['quarter_date'].dt.to_period('Q').nunique()} trimestres | {len(sel_hist)} lignes"
+        f"\n\U0001f5c2\ufe0f Historique complet des sélections {_freq_label}s: "
+        f"{n_periods} {period_noun} | {len(sel_hist)} lignes"
     )
     _display(sel_hist[hist_cols] if hist_cols else sel_hist)
 
@@ -686,10 +835,10 @@ def display_satellite_selection(results_level2, quarter_selection_df, satellite_
         if 'score_level2' in sel_hist.columns:
             agg_dict['score_moyen'] = ('score_level2', 'mean')
         switch_summary = (
-            sel_hist.assign(quarter=sel_hist['quarter_date'].dt.to_period('Q').astype(str))
-            .groupby('quarter', as_index=False).agg(**agg_dict)
+            sel_hist.assign(periode=sel_hist['quarter_date'].dt.to_period(_period_freq).astype(str))
+            .groupby('periode', as_index=False).agg(**agg_dict)
         )
-        print('\nRésumé trimestriel des sélections:')
+        print(f'\nRésumé {_freq_label} des sélections:')
         if 'score_moyen' in switch_summary.columns:
             _display(switch_summary.style.format({'score_moyen': '{:.3f}'}))
         else:
@@ -708,3 +857,159 @@ def display_satellite_selection(results_level2, quarter_selection_df, satellite_
             _display(final_df[cols_f].sort_values(sort_f) if sort_f else final_df[cols_f])
     else:
         print('Sélection finale introuvable.')
+
+
+# ── Holdings timeline display ────────────────────────────────────────────────
+
+def display_holdings_timeline(quarter_selection_df, figsize=(17, 7)):
+    """
+    Gantt-style chart: shows exactly which fund is held at each period, per strat and per rank slot.
+    Switch events are highlighted with a red dashed line.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.colors import to_rgba
+
+    if quarter_selection_df is None or quarter_selection_df.empty:
+        print("Aucune sélection disponible.")
+        return None
+
+    df = quarter_selection_df.copy()
+    df["quarter_date"] = pd.to_datetime(df["quarter_date"])
+
+    all_tickers = sorted(df["ticker"].unique())
+    cmap = plt.cm.get_cmap("tab20", max(len(all_tickers), 1))
+    ticker_color = {t: cmap(i) for i, t in enumerate(all_tickers)}
+
+    def short(t):
+        return t.split(" ")[0]
+
+    strats = sorted(df["Strat"].unique())
+    ranks = sorted(df["rank_in_strat"].unique())
+
+    fig, axes = plt.subplots(len(strats), 1, figsize=figsize, sharex=True)
+    if len(strats) == 1:
+        axes = [axes]
+
+    all_dates = sorted(df["quarter_date"].unique())
+    freq_months = int(round((all_dates[1] - all_dates[0]).days / 30)) if len(all_dates) > 1 else 1
+
+    for ax, strat in zip(axes, strats):
+        sub = df[df["Strat"] == strat].copy().sort_values(["quarter_date", "rank_in_strat"])
+        strat_ranks = sorted(sub["rank_in_strat"].unique())
+        y_pos = {r: i for i, r in enumerate(reversed(strat_ranks))}
+
+        for rank in strat_ranks:
+            r_df = sub[sub["rank_in_strat"] == rank].sort_values("quarter_date")
+            if r_df.empty:
+                continue
+            # Build consecutive holding blocks
+            groups, cur = [], None
+            for _, row in r_df.iterrows():
+                if cur is None or row["ticker"] != cur["ticker"]:
+                    if cur:
+                        groups.append(cur)
+                    cur = {"ticker": row["ticker"], "start": row["quarter_date"],
+                           "end": row["quarter_date"]}
+                else:
+                    cur["end"] = row["quarter_date"]
+            if cur:
+                groups.append(cur)
+
+            y = y_pos[rank]
+            for grp in groups:
+                end_draw = grp["end"] + pd.DateOffset(months=freq_months)
+                width_days = (end_draw - grp["start"]).days
+                color = ticker_color[grp["ticker"]]
+                ax.barh(y, width_days, left=grp["start"], height=0.65,
+                        color=color, alpha=0.88, edgecolor="white", linewidth=0.5)
+                mid_date = grp["start"] + (end_draw - grp["start"]) / 2
+                ax.text(mid_date, y, short(grp["ticker"]),
+                        ha="center", va="center", fontsize=8, fontweight="bold",
+                        color="white")
+
+        # Switch markers (red dashed lines)
+        switches = sub[sub["switch_flag"] == 1]
+        switch_dates = switches["quarter_date"].unique()
+        for sd in switch_dates:
+            ax.axvline(sd, color="crimson", linewidth=1.5, linestyle="--", alpha=0.75)
+
+        ax.set_yticks(list(y_pos.values()))
+        ax.set_yticklabels([f"Rang {r}" for r in reversed(strat_ranks)], fontsize=9)
+        ax.set_title(f"  {strat}", fontweight="bold", loc="left", pad=3, fontsize=10)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.grid(axis="x", alpha=0.2, linestyle=":")
+
+    # X-axis formatting
+    import matplotlib.dates as mdates
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    n_months = (all_dates[-1] - all_dates[0]).days // 30 if len(all_dates) > 1 else 12
+    interval = max(1, n_months // 20)
+    axes[-1].xaxis.set_major_locator(mdates.MonthLocator(interval=interval))
+    plt.setp(axes[-1].xaxis.get_majorticklabels(), rotation=45, ha="right", fontsize=8)
+
+    # Legend
+    handles = [mpatches.Patch(color=ticker_color[t], label=short(t)) for t in all_tickers]
+    switch_handle = plt.Line2D([0], [0], color="crimson", linestyle="--", linewidth=1.5, label="Switch")
+    fig.legend(handles=handles + [switch_handle], loc="lower center",
+               ncol=min(10, len(all_tickers) + 1), fontsize=8,
+               title="Fonds détenus", title_fontsize=9, bbox_to_anchor=(0.5, -0.02))
+
+    fig.suptitle("📋 Holdings Satellite — Timeline des fonds détenus", fontsize=12,
+                 fontweight="bold", y=1.01)
+    plt.tight_layout()
+    return fig
+
+
+def display_holdings_table(quarter_selection_df, review_freq_months=1):
+    """
+    Pivot table: rows = periods, columns = (STRAT, Rang), values = fund held.
+    Switches are highlighted in bold / yellow background via pandas Styler.
+    """
+    from IPython.display import display as _display
+
+    if quarter_selection_df is None or quarter_selection_df.empty:
+        print("Aucune sélection disponible.")
+        return
+
+    df = quarter_selection_df.copy()
+    df["quarter_date"] = pd.to_datetime(df["quarter_date"])
+
+    _freq_labels = {1: "mensuel", 2: "bimestriel", 3: "trimestriel", 6: "semestriel", 12: "annuel"}
+    _freq_label = _freq_labels.get(review_freq_months, f"{review_freq_months}-mensuel")
+
+    # Short display name
+    df["fond"] = df["ticker"].str.split(" ").str[0]
+
+    # Pivot: period x (Strat, Rang)
+    pivot = df.pivot_table(
+        index="quarter_date", columns=["Strat", "rank_in_strat"],
+        values="fond", aggfunc="first"
+    )
+    pivot.index = pivot.index.strftime("%Y-%m")
+    pivot.columns = [f"{s} R{r}" for s, r in pivot.columns]
+
+    # Switch flags for highlighting
+    df["col_key"] = df.apply(lambda r: f"{r['Strat']} R{r['rank_in_strat']}", axis=1)
+    df["period"] = df["quarter_date"].dt.strftime("%Y-%m")
+    switch_cells = set(
+        zip(df.loc[df["switch_flag"] == 1, "period"],
+            df.loc[df["switch_flag"] == 1, "col_key"])
+    )
+
+    def highlight_switches(df_styled):
+        styles = pd.DataFrame("", index=df_styled.index, columns=df_styled.columns)
+        for (period, col) in switch_cells:
+            if period in df_styled.index and col in df_styled.columns:
+                styles.loc[period, col] = "background-color: #fff3cd; font-weight: bold;"
+        return styles
+
+    n_switches = df["switch_flag"].sum()
+    n_periods = pivot.shape[0]
+    print(f"\n📋 Table des fonds détenus — révision {_freq_label} | {n_periods} périodes | {n_switches} switches (↓ cellules en jaune)")
+    _display(
+        pivot.style
+        .apply(highlight_switches, axis=None)
+        .set_properties(**{"font-size": "11px", "text-align": "center"})
+        .set_table_styles([{"selector": "th", "props": [("font-size", "10px"), ("text-align", "center")]}])
+    )

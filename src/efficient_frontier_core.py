@@ -482,6 +482,7 @@ def _plot_frontier(
     target_vols: Tuple[float, ...],
     fig_dir: Path, dpi: int,
     sharpe_label: str = "Sharpe (IS)",
+    is_label: str = "IS",
 ) -> None:
     fig, ax = plt.subplots(figsize=(9, 6))
     sc = ax.scatter(sim_vols, sim_rets, c=sim_sharpe, cmap="viridis",
@@ -506,15 +507,15 @@ def _plot_frontier(
                         textcoords="offset points", xytext=(6, -4*(i-1)),
                         fontsize=7, color=colors.get(name, "grey"))
 
-    ax.set_xlabel("Volatilité annualisée (IS 2019-2020)")
-    ax.set_ylabel("Rendement annualisé (IS 2019-2020)")
-    ax.set_title("Frontière efficiente – 3 ETF Core\n(calibration 2019-2020, daily)")
+    ax.set_xlabel(f"Volatilité annualisée ({is_label})")
+    ax.set_ylabel(f"Rendement annualisé ({is_label})")
+    ax.set_title(f"Frontière efficiente – 3 ETF Core\n(calibration {is_label}, daily)")
     ax.legend(fontsize=8)
     plt.tight_layout()
     return fig
 
 
-def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
+def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int, oos_label: str = "OOS") -> None:
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     # ── Cumulative OOS ────────────────────────────────────────────────────────
@@ -524,7 +525,7 @@ def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
             continue
         cum = 100 * (1 + d["oos_ret"]).cumprod()
         ax.plot(cum.index, cum.values, label=name, color=COLORS.get(name, "grey"))
-    ax.set_title("Performance cumulée OOS 2021-2025 (base 100)")
+    ax.set_title(f"Performance cumulée {oos_label} (base 100)")
     ax.set_xlabel("Date")
     ax.set_ylabel("Valeur (base 100)")
     ax.legend(fontsize=8)
@@ -538,7 +539,7 @@ def _plot_oos_perf(strategies: Dict, fig_dir: Path, dpi: int) -> None:
                    color=[COLORS.get(n, "grey") for n in names])
     ax2.set_xticks(range(len(names)))
     ax2.set_xticklabels(names, rotation=25, ha="right", fontsize=8)
-    ax2.set_title("Sharpe OOS (exces rf) 2021-2025 par stratégie")
+    ax2.set_title(f"Sharpe OOS (exces rf) {oos_label} par stratégie")
     ax2.set_ylabel("Sharpe (exces rf)")
     ax2.axhline(0, color="black", lw=0.8)
     for bar, v in zip(bars, sharpes):
@@ -598,9 +599,36 @@ def _weights_selection_dataframe(
 #  Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main() -> Tuple[Dict, pd.DataFrame]:
+def main(
+    core_equity: str | None = None,
+    core_rates: str | None = None,
+    core_credit: str | None = None,
+    calib_start: str | None = None,
+    calib_end: str | None = None,
+    oos_start: str | None = None,
+    oos_end: str | None = None,
+) -> Tuple[Dict, pd.DataFrame]:
     cfg = FrontierConfig()
     cfg.fig_dir.mkdir(parents=True, exist_ok=True)
+
+    # Override dates if provided
+    if calib_start is not None:
+        object.__setattr__(cfg, 'calib_start', calib_start)
+    if calib_end is not None:
+        object.__setattr__(cfg, 'calib_end', calib_end)
+    if oos_start is not None:
+        object.__setattr__(cfg, 'oos_start', oos_start)
+    if oos_end is not None:
+        object.__setattr__(cfg, 'oos_end', oos_end)
+
+    # Override tickers in CoreConfig if provided by caller
+    from src.core_data import CoreConfig as _CoreConfig
+    _base = _CoreConfig()
+    core_cfg = _CoreConfig(
+        selected_equity=core_equity if core_equity is not None else _base.selected_equity,
+        selected_rates=core_rates if core_rates is not None else _base.selected_rates,
+        selected_credit=core_credit if core_credit is not None else _base.selected_credit,
+    )
 
     print("=" * 60)
     print("  COMPARAISON DES STRATÉGIES CORE (Markowitz daily)")
@@ -610,7 +638,7 @@ def main() -> Tuple[Dict, pd.DataFrame]:
 
     # ── Chargement ────────────────────────────────────────────────────────────
     print("\n[1] Chargement des log-rendements journaliers des 3 ETF depuis l'Excel source...")
-    df = load_selected_core_log_returns(verbose=False)
+    df = load_selected_core_log_returns(cfg=core_cfg, verbose=False)
     df = df.sort_index()
     tickers = list(df.columns)
     print(f"  ETFs : {tickers}")
@@ -709,6 +737,8 @@ def main() -> Tuple[Dict, pd.DataFrame]:
 
     # ── Figures ───────────────────────────────────────────────────────────────
     print("\n[5] Génération des figures...")
+    _is_lbl = f"IS {cfg.calib_start[:4]}-{cfg.calib_end[:4]}"
+    _oos_lbl = f"OOS {cfg.oos_start[:4]}-{cfg.oos_end[:4]}"
     fig_frontier = _plot_frontier(
         s_rets,
         s_vols,
@@ -719,8 +749,9 @@ def main() -> Tuple[Dict, pd.DataFrame]:
         cfg.fig_dir,
         cfg.dpi,
         sharpe_label="Sharpe IS (exces rf Bund)",
+        is_label=_is_lbl,
     )
-    fig_oos = _plot_oos_perf(strategies, cfg.fig_dir, cfg.dpi)
+    fig_oos = _plot_oos_perf(strategies, cfg.fig_dir, cfg.dpi, oos_label=_oos_lbl)
 
     print("\n  ✓  Frontière efficiente terminée.")
     return strategies, comp_df, fig_frontier, fig_oos

@@ -105,8 +105,8 @@ def analyze_core_vs_satellite(ret_cmp, analysis_start, analysis_end, outdir='out
     alpha_daily = ret_cmp['satellite'] - (beta_static * ret_cmp['core'])
     alpha_daily.name = 'alpha_daily'
 
-    # Rolling
-    win = 126
+    # Rolling (2 ans)
+    win = 504
     beta_roll = (ret_cmp['satellite'].rolling(win).cov(ret_cmp['core'])
                  / ret_cmp['core'].rolling(win).var().replace(0, np.nan))
     corr_roll = ret_cmp['satellite'].rolling(win).corr(ret_cmp['core'])

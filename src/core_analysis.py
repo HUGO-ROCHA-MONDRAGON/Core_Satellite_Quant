@@ -86,8 +86,16 @@ def run_core_simulation(strategies, core_3_log, core_df, CORE_TICKERS, config_co
         rebalance_lookup = {}
         for _, row in rebalance_df.iterrows():
             dt = pd.Timestamp(row['date']) if 'date' in row else pd.Timestamp(row.name)
-            turnover = float(row.get('turnover', 0.0)) if hasattr(row, 'get') else 0.0
-            event_cost_pct = turnover * 2.0 * tx_bps_side / 10000.0 + tx_fixed_bps / 10000.0
+            # Compute turnover = sum of |target_val - current_val| / portfolio_value
+            pv = float(row.get('portfolio_value_before', 1.0))
+            turnover = 0.0
+            if pv > 0:
+                for t in tickers:
+                    tgt = row.get(f'{t}_target_val', 0.0)
+                    cur = row.get(f'{t}_current_val', 0.0)
+                    turnover += abs(tgt - cur)
+                turnover /= pv  # one-way turnover as fraction
+            event_cost_pct = turnover * tx_bps_side / 10000.0 + tx_fixed_bps / 10000.0
             rebalance_lookup[dt] = max(event_cost_pct, 0.0)
 
         for i, d in enumerate(dates):
@@ -358,12 +366,13 @@ def plot_volatility_and_costs(sim):
     print("=" * 80)
 
     # A) Rolling volatility
-    vol_window_map = {'6m': 126, '1y': 252}
-    vol_window_choice = config_core.get('vol_window', '6m')
+    vol_window_map = {'6m': 126, '1y': 252, '2y': 504}
+    vol_window_choice = config_core.get('vol_window', '2y')
     if vol_window_choice not in vol_window_map:
-        vol_window_choice = '6m'
+        vol_window_choice = '2y'
     vol_window = vol_window_map[vol_window_choice]
-    window_label = '6 mois (126j)' if vol_window_choice == '6m' else '1 an (252j)'
+    _wl = {'6m': '6 mois (126j)', '1y': '1 an (252j)', '2y': '2 ans (504j)'}
+    window_label = _wl.get(vol_window_choice, f'{vol_window}j')
 
     core_weights_array = np.array([core_weights[t] for t in tickers])
     core_returns = (daily_returns_for_sim * core_weights_array).sum(axis=1)

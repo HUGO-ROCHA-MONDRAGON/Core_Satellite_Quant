@@ -54,7 +54,7 @@ def rebase_to_100(prices):
 
 
 def enhanced_table(prices, meta, first_dates):
-    """Vol annualisée + return annualisé + returns par année 2019-2025."""
+    """Vol annualisée + return annualisé + returns par année (dynamique)."""
     returns = prices.pct_change(fill_method=None)
     vol_ann = returns.std(skipna=True) * np.sqrt(252.0)
     n_obs = returns.notna().sum()
@@ -72,7 +72,9 @@ def enhanced_table(prices, meta, first_dates):
     table["vol_annualisee"] = vol_ann.values
     table["ret_annualise"] = ann_ret.values
 
-    for year in range(2019, 2026):
+    year_min = int(returns.index.min().year)
+    year_max = int(returns.index.max().year)
+    for year in range(year_min, year_max + 1):
         mask = returns.index.year == year
         yr_ret = returns.loc[mask]
         if yr_ret.empty:
@@ -186,13 +188,15 @@ def display_core_blocks(block_data, core_tickers, excel_path, start_date):
         print(f'  {bname}: {n} ETF retenus | {d0} → {d1}')
     print(f'\nETF Core sélectionnés : {", ".join(core_tickers)}')
 
-    fmt_pct = {c: '{:.2%}' for c in ['vol_annualisee', 'ret_annualise'] + [f'ret_{y}' for y in range(2019, 2026)]}
+    start_year = start_date.year
+    year_cols = [c for c in list(block_data.values())[0]['table'].columns if c.startswith('ret_') and c[4:].isdigit()]
+    fmt_pct = {c: '{:.2%}' for c in ['vol_annualisee', 'ret_annualise'] + year_cols}
     fmt_num = {'ter_pct': '{:.2f}'}
     fmt_all = {**fmt_pct, **fmt_num}
 
     for block_name, data in block_data.items():
         print('=' * 130)
-        print(f'Tableau — bloc {block_name} (depuis 2019) : volatilité + returns annualisés + returns par année')
+        print(f'Tableau — bloc {block_name} (depuis {start_year}) : volatilité + returns annualisés + returns par année')
         print('=' * 130)
         _display(data['table'].style.format(fmt_all))
 
@@ -209,15 +213,17 @@ def plot_core_blocks(block_data, core_tickers, fig_dir=None):
             lw = 2.2 if ticker in core_tickers else 1.0
             alpha = 1.0 if ticker in core_tickers else 0.7
             ax.plot(s.index, s.values, linewidth=lw, alpha=alpha, label=ticker)
-        ax.set_title(f"Bloc Core {block_name} — tous les ETF depuis 2019", fontsize=13, fontweight="bold")
+        start_yr = rebased.index.min().year
+        ax.set_title(f"Bloc Core {block_name} — tous les ETF depuis {start_yr}", fontsize=13, fontweight="bold")
         ax.set_ylabel("Base 100")
         ax.grid(alpha=0.25)
         ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=7, frameon=False, ncol=1)
     axes[-1].set_xlabel("Date")
-    fig.suptitle("Core — évolution de tous les ETF par bloc depuis 2019", fontsize=16, y=1.01)
+    _start = list(block_data.values())[0]['rebased'].index.min().year
+    fig.suptitle(f"Core — évolution de tous les ETF par bloc depuis {_start}", fontsize=16, y=1.01)
 
     if fig_dir is not None:
         Path(fig_dir).mkdir(parents=True, exist_ok=True)
-        plt.savefig(Path(fig_dir) / "core_blocs_tous_etf_depuis_2019.png", dpi=160, bbox_inches="tight")
+        plt.savefig(Path(fig_dir) / f"core_blocs_tous_etf_depuis_{_start}.png", dpi=160, bbox_inches="tight")
 
     return fig

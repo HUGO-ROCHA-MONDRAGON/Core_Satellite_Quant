@@ -110,7 +110,7 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
     ann_sat = sat_ret.groupby(sat_ret.index.year).apply(lambda x: (1.0 + x).prod() - 1.0)
     ann_bloc_contrib = bloc_contrib_piv.groupby(bloc_contrib_piv.index.year).sum()
 
-    beta_window = 126
+    beta_window = 504  # 2 ans
     sat_beta_rolling = (
         sat_ret.rolling(beta_window).cov(core_ret)
         / core_ret.rolling(beta_window).var().replace(0, np.nan)
@@ -143,9 +143,9 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
     axes[0, 1].set_ylabel('Drawdown (%)')
     axes[0, 1].grid(alpha=0.25)
 
-    roll_vol = sat_ret.rolling(63).std() * np.sqrt(252)
+    roll_vol = sat_ret.rolling(504).std() * np.sqrt(252)
     axes[1, 0].plot(roll_vol.index, roll_vol * 100, lw=1.8, color='#2ca02c')
-    axes[1, 0].set_title('Satellite dynamique — Vol rolling 63j')
+    axes[1, 0].set_title('Satellite dynamique — Vol rolling 2 ans')
     axes[1, 0].set_ylabel('Vol annualisée (%)')
     axes[1, 0].grid(alpha=0.25)
 
