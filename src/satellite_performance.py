@@ -5,7 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from IPython.display import display
 
-from src.utils import ann_return, ann_vol
+from src.utils import ann_return, ann_vol, sharpe0
 
 
 # ── Validation / cache (cell 21) ────────────────────────────────────────────
@@ -102,8 +102,7 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
     sat_metrics = pd.DataFrame({
         'Ret ann.': [ann_return(sat_ret)],
         'Vol ann.': [ann_vol(sat_ret)],
-        'Sharpe (rf=0)': [(ann_return(sat_ret) / ann_vol(sat_ret))
-                          if pd.notna(ann_vol(sat_ret)) and ann_vol(sat_ret) > 0 else np.nan],
+        'Sharpe (rf=2%)': [sharpe0(sat_ret)],
         'Max DD': [sat_dd.min()],
     }, index=['Satellite dynamique'])
 
@@ -111,16 +110,17 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
     ann_bloc_contrib = bloc_contrib_piv.groupby(bloc_contrib_piv.index.year).sum()
 
     beta_window = 504  # 2 ans
+    beta_min_p = 63
     sat_beta_rolling = (
-        sat_ret.rolling(beta_window).cov(core_ret)
-        / core_ret.rolling(beta_window).var().replace(0, np.nan)
+        sat_ret.rolling(beta_window, min_periods=beta_min_p).cov(core_ret)
+        / core_ret.rolling(beta_window, min_periods=beta_min_p).var().replace(0, np.nan)
     )
 
     # Display
     print('Métriques Satellite dynamique :')
     display(sat_metrics.style.format({
         'Ret ann.': '{:+.2%}', 'Vol ann.': '{:.2%}',
-        'Sharpe (rf=0)': '{:.2f}', 'Max DD': '{:.2%}',
+        'Sharpe (rf=2%)': '{:.2f}', 'Max DD': '{:.2%}',
     }))
     print('\nReturns annuels Satellite :')
     display(ann_sat.to_frame('ret_ann').style.format('{:+.2%}'))
@@ -143,7 +143,7 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
     axes[0, 1].set_ylabel('Drawdown (%)')
     axes[0, 1].grid(alpha=0.25)
 
-    roll_vol = sat_ret.rolling(504).std() * np.sqrt(252)
+    roll_vol = sat_ret.rolling(504, min_periods=63).std() * np.sqrt(252)
     axes[1, 0].plot(roll_vol.index, roll_vol * 100, lw=1.8, color='#2ca02c')
     axes[1, 0].set_title('Satellite dynamique — Vol rolling 2 ans')
     axes[1, 0].set_ylabel('Vol annualisée (%)')

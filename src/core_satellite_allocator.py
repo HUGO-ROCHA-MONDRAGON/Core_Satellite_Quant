@@ -31,15 +31,21 @@ def allocate_core_satellite_dynamic(
     rebalance_freq="ME",
     target_vol=0.10,
     deadband=0.005,
-    w_sat_min=0.25,
+    w_sat_min=0.20,
     w_sat_max=0.30,
     w_sat_step=0.005,
     initial_w_sat=None,
     annualization=252,
+    rf_annual=0.02,
+    vol_floor=0.095,
+    vol_cap=0.105,
     verbose=True,
 ):
     """
-    Dynamic Core/Satellite allocation with volatility target and deadband.
+    Dynamic Core/Satellite allocation: maximize ex-ante Sharpe ratio
+    subject to vol ∈ [vol_floor, vol_cap] and w_sat ∈ [w_sat_min, w_sat_max].
+
+    Falls back to target_vol ± deadband if no weight satisfies vol constraints.
 
     Returns: (weights_daily, portfolio_returns, portfolio_vol_rolling, decisions_df)
     """
@@ -57,9 +63,13 @@ def allocate_core_satellite_dynamic(
     if len(w_grid) == 0:
         raise ValueError("La grille de poids est vide. Vérifie w_sat_min/w_sat_max/w_sat_step.")
 
+    rf_daily = (1.0 + rf_annual) ** (1.0 / annualization) - 1.0
+
     vol_core = ret["core"].rolling(lookback, min_periods=lookback).std() * np.sqrt(annualization)
     vol_sat = ret["sat"].rolling(lookback, min_periods=lookback).std() * np.sqrt(annualization)
     corr_cs = ret["core"].rolling(lookback, min_periods=lookback).corr(ret["sat"])
+    mu_core = ret["core"].rolling(lookback, min_periods=lookback).mean() * annualization
+    mu_sat = ret["sat"].rolling(lookback, min_periods=lookback).mean() * annualization
 
     reb_dates = rebalance_dates_from_index(ret.index, rebalance_freq=rebalance_freq)
 
@@ -67,15 +77,14 @@ def allocate_core_satellite_dynamic(
     decisions = []
     w_sat_rebal = pd.Series(index=reb_dates, dtype=float)
 
-    low_band = target_vol - deadband
-    high_band = target_vol + deadband
-
     for dt in reb_dates:
         sc = vol_core.loc[dt] if dt in vol_core.index else np.nan
         ss = vol_sat.loc[dt] if dt in vol_sat.index else np.nan
         rc = corr_cs.loc[dt] if dt in corr_cs.index else np.nan
+        mc = mu_core.loc[dt] if dt in mu_core.index else np.nan
+        ms = mu_sat.loc[dt] if dt in mu_sat.index else np.nan
 
-        if pd.isna(sc) or pd.isna(ss) or pd.isna(rc):
+        if pd.isna(sc) or pd.isna(ss) or pd.isna(rc) or pd.isna(mc) or pd.isna(ms):
             decision = "insufficient_data"
             new_w_sat = current_w_sat
             sigma_current = np.nan
@@ -83,19 +92,39 @@ def allocate_core_satellite_dynamic(
         else:
             sigma_current = float(portfolio_vol_ex_ante(np.array([current_w_sat]), sc, ss, rc)[0])
 
-            if low_band <= sigma_current <= high_band:
-                decision = "keep_deadband"
-                new_w_sat = current_w_sat
-                sigma_opt = sigma_current
-            else:
-                sigma_grid = portfolio_vol_ex_ante(w_grid, sc, ss, rc)
-                idx_best = np.argmin(np.abs(sigma_grid - target_vol))
+            # Compute vol and Sharpe for each grid point
+            sigma_grid = portfolio_vol_ex_ante(w_grid, sc, ss, rc)
+            mu_grid = (1.0 - w_grid) * mc + w_grid * ms
+            sharpe_grid = (mu_grid - rf_annual) / np.where(sigma_grid > 0, sigma_grid, np.nan)
+
+            # Filter by vol constraint [vol_floor, vol_cap]
+            feasible = (sigma_grid >= vol_floor) & (sigma_grid <= vol_cap)
+
+            if feasible.any():
+                # Max Sharpe among feasible weights
+                sharpe_feasible = np.where(feasible, sharpe_grid, -np.inf)
+                idx_best = int(np.argmax(sharpe_feasible))
                 new_w_sat = float(w_grid[idx_best])
                 sigma_opt = float(sigma_grid[idx_best])
-                decision = "rebalance"
+
+                if new_w_sat == current_w_sat:
+                    decision = "keep_optimal"
+                else:
+                    decision = "rebalance"
+            else:
+                # Fallback: closest to target_vol (deadband logic)
+                if (target_vol - deadband) <= sigma_current <= (target_vol + deadband):
+                    decision = "keep_deadband"
+                    new_w_sat = current_w_sat
+                    sigma_opt = sigma_current
+                else:
+                    idx_best = int(np.argmin(np.abs(sigma_grid - target_vol)))
+                    new_w_sat = float(w_grid[idx_best])
+                    sigma_opt = float(sigma_grid[idx_best])
+                    decision = "rebalance_fallback"
 
         if verbose:
-            msg = f"[{dt.date()}] decision={decision:>16} | w_sat: {current_w_sat:.3f} -> {new_w_sat:.3f}"
+            msg = f"[{dt.date()}] decision={decision:>18} | w_sat: {current_w_sat:.3f} -> {new_w_sat:.3f}"
             if not pd.isna(sigma_current):
                 msg += f" | vol_cur={sigma_current:.2%} | vol_opt={sigma_opt:.2%}"
             print(msg)

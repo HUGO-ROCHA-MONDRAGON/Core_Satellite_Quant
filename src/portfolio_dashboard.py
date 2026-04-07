@@ -98,7 +98,7 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
                         (1.0 + sat_ret).prod() - 1.0],
         'Ret ann.': [ann_return(global_ret), ann_return(core_ret), ann_return(sat_ret)],
         'Vol ann.': [ann_vol(global_ret), ann_vol(core_ret), ann_vol(sat_ret)],
-        'Sharpe (rf=0)': [sharpe0(global_ret), sharpe0(core_ret), sharpe0(sat_ret)],
+        'Sharpe (rf=2%)': [sharpe0(global_ret), sharpe0(core_ret), sharpe0(sat_ret)],
         'Max DD': [max_dd(global_ret), max_dd(core_ret), max_dd(sat_ret)],
         'Calmar': [calmar(global_ret), calmar(core_ret), calmar(sat_ret)],
     }, index=['Portefeuille global', 'Core choisi', 'Satellite dynamique'])
@@ -113,7 +113,8 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
         sat_ret.groupby(sat_ret.index.year).apply(lambda x: (1.0 + x).prod() - 1.0).rename('Satellite'),
     ], axis=1)
 
-    # Fees
+    # Fees — Les rendements ETF/fonds sont DÉJÀ nets de TER (intégrés dans les NAV).
+    # On estime uniquement les coûts de switching (transaction) lors des rebalancements.
     core_ter_bps_est = float(weighted_core_ter_bps) if weighted_core_ter_bps is not None else float(core_ter_bps)
 
     if ter_wavg_daily is not None and isinstance(ter_wavg_daily, pd.Series) and not ter_wavg_daily.empty:
@@ -125,22 +126,27 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
         weights_dyn_real['w_core'] * core_ter_bps_est
         + weights_dyn_real['w_sat'] * sat_ter_bps_daily
     ).rename('portfolio_ter_bps_annualized')
-    portfolio_ter_daily_drag = (portfolio_ter_bps_daily / 10000.0 / 252.0).rename('portfolio_ter_daily_drag')
 
-    global_ret_net_est = (global_ret - portfolio_ter_daily_drag).rename('portfolio_return_net_est')
-    gross_nav = (1.0 + global_ret).cumprod().rename('portfolio_nav_gross')
-    net_nav_est = (1.0 + global_ret_net_est).cumprod().rename('portfolio_nav_net_est')
-    fee_drag_nav = (gross_nav - net_nav_est).rename('fee_drag_nav')
-
+    # Switching costs: each allocation rebalance costs ~10 bps one-way on the traded notional
+    switching_cost_bps = 10.0  # bps per one-way trade
     alloc_turnover_daily = (
         0.5 * weights_dyn_real.diff().abs().sum(axis=1)
     ).fillna(0.0).rename('allocation_turnover_daily')
-    monthly_fee_bps = portfolio_ter_bps_daily.resample('ME').mean()
+    switching_drag_daily = (alloc_turnover_daily * switching_cost_bps / 10000.0).rename('switching_drag_daily')
+
+    # NAV net = brut - switching costs cumulés (pas de double-comptage TER)
+    gross_nav = (1.0 + global_ret).cumprod().rename('portfolio_nav_gross')
+    global_ret_net_est = (global_ret - switching_drag_daily).rename('portfolio_return_net_est')
+    net_nav_est = (1.0 + global_ret_net_est).cumprod().rename('portfolio_nav_net_est')
+    fee_drag_nav = (gross_nav - net_nav_est).rename('switching_drag_nav')
+
+    monthly_switching = switching_drag_daily.resample('ME').sum()
     monthly_turnover = alloc_turnover_daily.resample('ME').sum()
 
     annual_fee_table = pd.concat([
-        portfolio_ter_bps_daily.resample('YE').mean().rename('TER global moyen (bps/an)'),
+        portfolio_ter_bps_daily.resample('YE').mean().rename('TER intégré (bps/an, info)'),
         alloc_turnover_daily.resample('YE').sum().rename('Turnover allocation cumulé'),
+        (switching_drag_daily * 10000).resample('YE').sum().rename('Coût switching cumulé (bps)'),
     ], axis=1)
     annual_fee_table.index = annual_fee_table.index.year
 
@@ -148,7 +154,7 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
     fee_detail_df = pd.concat([
         global_ret.rename('portfolio_return_gross'), global_ret_net_est,
         gross_nav, net_nav_est, fee_drag_nav,
-        portfolio_ter_bps_daily, portfolio_ter_daily_drag, alloc_turnover_daily,
+        portfolio_ter_bps_daily, switching_drag_daily, alloc_turnover_daily,
     ], axis=1)
     fee_detail_df.to_csv(outdir / 'core_sat_dynamic_fee_estimates.csv')
     comparison_metrics.to_csv(outdir / 'core_sat_dynamic_metrics.csv')
@@ -163,10 +169,10 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
         {'Indicateur': 'Poids satellite moyen', 'Valeur': weights_dyn_real['w_sat'].mean(), 'Type': 'pct'},
         {'Indicateur': 'Poids satellite min', 'Valeur': weights_dyn_real['w_sat'].min(), 'Type': 'pct'},
         {'Indicateur': 'Poids satellite max', 'Valeur': weights_dyn_real['w_sat'].max(), 'Type': 'pct'},
-        {'Indicateur': 'TER Core utilisé', 'Valeur': core_ter_bps_est, 'Type': 'bps'},
-        {'Indicateur': 'TER satellite moyen', 'Valeur': sat_ter_bps_daily.mean(), 'Type': 'bps'},
-        {'Indicateur': 'TER global moyen estimé', 'Valeur': portfolio_ter_bps_daily.mean(), 'Type': 'bps'},
-        {'Indicateur': 'Drag TER cumulé estimé',
+        {'Indicateur': 'TER Core (info, intégré NAV)', 'Valeur': core_ter_bps_est, 'Type': 'bps'},
+        {'Indicateur': 'TER satellite moyen (info, intégré NAV)', 'Valeur': sat_ter_bps_daily.mean(), 'Type': 'bps'},
+        {'Indicateur': 'TER global moyen (info, intégré NAV)', 'Valeur': portfolio_ter_bps_daily.mean(), 'Type': 'bps'},
+        {'Indicateur': 'Coût switching cumulé estimé',
          'Valeur': gross_nav.iloc[-1] - net_nav_est.iloc[-1], 'Type': 'pct'},
         {'Indicateur': 'Nb rebalancements effectifs',
          'Valeur': (rebalance_log_real['decision'] == 'rebalance').sum(), 'Type': 'int'},
@@ -181,7 +187,7 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
     print('\nMétriques comparatives :')
     display(comparison_metrics.style.format({
         'Cumul total': '{:+.2%}', 'Ret ann.': '{:+.2%}', 'Vol ann.': '{:.2%}',
-        'Sharpe (rf=0)': '{:.2f}', 'Max DD': '{:.2%}', 'Calmar': '{:.2f}',
+        'Sharpe (rf=2%)': '{:.2f}', 'Max DD': '{:.2%}', 'Calmar': '{:.2f}',
     }))
     print('\nIndicateurs portefeuille global :')
     display(diag_display)
@@ -189,7 +195,8 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
     display(annual_returns_table.style.format('{:+.2%}'))
     print('\nFrais / turnover annuels :')
     display(annual_fee_table.style.format({
-        'TER global moyen (bps/an)': '{:.1f}', 'Turnover allocation cumulé': '{:.2f}',
+        'TER intégré (bps/an, info)': '{:.1f}', 'Turnover allocation cumulé': '{:.2f}',
+        'Coût switching cumulé (bps)': '{:.1f}',
     }))
 
     # Dashboard (3x2)
@@ -256,13 +263,12 @@ def run_final_portfolio_analysis(ret_cmp, allocator_params, analysis_start, anal
     axes[1, 1].grid(True, alpha=0.25)
     axes[1, 1].legend(frameon=False)
 
-    # Fees + turnover
-    axes[2, 0].plot(monthly_fee_bps.index, monthly_fee_bps, lw=2.0, color='#0f766e',
-                    label='TER global moyen mensuel')
-    axes[2, 0].axhline(portfolio_ter_bps_daily.mean(), color='#0f766e', ls='--', lw=1.0,
-                       label=f"Moyenne {portfolio_ter_bps_daily.mean():.1f} bps")
-    axes[2, 0].set_title('Frais estimés du portefeuille global')
-    axes[2, 0].set_ylabel('bps/an')
+    # Switching costs + turnover
+    monthly_switching_bps = (switching_drag_daily * 10000).resample('ME').sum()
+    axes[2, 0].bar(monthly_switching_bps.index, monthly_switching_bps, width=20, color='#0f766e',
+                   alpha=0.7, label='Coût switching mensuel (bps)')
+    axes[2, 0].set_title('Coûts de switching estimés')
+    axes[2, 0].set_ylabel('bps')
     axes[2, 0].grid(True, alpha=0.25)
     ax_fee = axes[2, 0].twinx()
     ax_fee.plot(monthly_turnover.index, monthly_turnover, lw=1.3, color='#d62728', alpha=0.75,

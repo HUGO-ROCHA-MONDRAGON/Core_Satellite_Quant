@@ -105,14 +105,15 @@ def analyze_core_vs_satellite(ret_cmp, analysis_start, analysis_end, outdir='out
     alpha_daily = ret_cmp['satellite'] - (beta_static * ret_cmp['core'])
     alpha_daily.name = 'alpha_daily'
 
-    # Rolling (2 ans)
+    # Rolling (2 ans, avec min_periods=63 pour démarrer dès 2021)
     win = 504
-    beta_roll = (ret_cmp['satellite'].rolling(win).cov(ret_cmp['core'])
-                 / ret_cmp['core'].rolling(win).var().replace(0, np.nan))
-    corr_roll = ret_cmp['satellite'].rolling(win).corr(ret_cmp['core'])
-    vol_roll = ret_cmp.rolling(win).std() * np.sqrt(252.0)
-    alpha_rolling = (ret_cmp['satellite'].rolling(win).mean()
-                     - (beta_roll * ret_cmp['core'].rolling(win).mean()))
+    min_p = 63
+    beta_roll = (ret_cmp['satellite'].rolling(win, min_periods=min_p).cov(ret_cmp['core'])
+                 / ret_cmp['core'].rolling(win, min_periods=min_p).var().replace(0, np.nan))
+    corr_roll = ret_cmp['satellite'].rolling(win, min_periods=min_p).corr(ret_cmp['core'])
+    vol_roll = ret_cmp.rolling(win, min_periods=min_p).std() * np.sqrt(252.0)
+    alpha_rolling = (ret_cmp['satellite'].rolling(win, min_periods=min_p).mean()
+                     - (beta_roll * ret_cmp['core'].rolling(win, min_periods=min_p).mean()))
 
     alpha_annual = ret_cmp.groupby(ret_cmp.index.year).apply(
         lambda x: ann_return(x['satellite']) - beta_static * ann_return(x['core'])
@@ -126,7 +127,7 @@ def analyze_core_vs_satellite(ret_cmp, analysis_start, analysis_end, outdir='out
     metrics_cmp = pd.DataFrame({
         'Ann Return': [core_total_ret, sat_total_ret],
         'Ann Vol': [ann_vol(ret_cmp['core']), ann_vol(ret_cmp['satellite'])],
-        'Sharpe (rf=0)': [sharpe0(ret_cmp['core']), sharpe0(ret_cmp['satellite'])],
+        'Sharpe (rf=2%)': [sharpe0(ret_cmp['core']), sharpe0(ret_cmp['satellite'])],
         'Max DD': [max_dd(ret_cmp['core']), max_dd(ret_cmp['satellite'])],
         'Calmar': [calmar(ret_cmp['core']), calmar(ret_cmp['satellite'])],
         'Return Diff.': [np.nan, return_diff],
@@ -147,7 +148,7 @@ def analyze_core_vs_satellite(ret_cmp, analysis_start, analysis_end, outdir='out
     # Display
     print('\nComparative metrics: Core vs Satellite')
     display(metrics_cmp.style.format({
-        'Ann Return': '{:+.2%}', 'Ann Vol': '{:.2%}', 'Sharpe (rf=0)': '{:.2f}',
+        'Ann Return': '{:+.2%}', 'Ann Vol': '{:.2%}', 'Sharpe (rf=2%)': '{:.2f}',
         'Max DD': '{:.2%}', 'Calmar': '{:.2f}', 'Return Diff.': '{:+.2%}',
         'Alpha (CAPM)': '{:+.2%}',
     }))

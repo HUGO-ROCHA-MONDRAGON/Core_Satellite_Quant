@@ -29,12 +29,12 @@ def max_dd(s):
     return dd.min()
 
 
-def sharpe0(s):
+def sharpe0(s, rf_annual=0.02):
     ar = ann_return(s)
     av = ann_vol(s)
     if pd.isna(ar) or pd.isna(av) or av <= 0:
         return np.nan
-    return ar / av
+    return (ar - rf_annual) / av
 
 
 def calmar(s):
