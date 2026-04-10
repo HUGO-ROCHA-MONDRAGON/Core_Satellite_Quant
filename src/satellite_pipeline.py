@@ -792,7 +792,7 @@ def display_satellite_selection(results_level2, quarter_selection_df, satellite_
     # 1) Score niveau 2
     lvl2 = results_level2.copy() if isinstance(results_level2, pd.DataFrame) and not results_level2.empty else None
     if lvl2 is not None:
-        print(f'\n📊 Niveau 2 scores: {len(lvl2)} lignes')
+        print(f'\n Niveau 2 scores: {len(lvl2)} lignes')
         cols = [c for c in ['ticker', 'Strat', 'alpha_annual', 'expense_pct', 'score_level2'] if c in lvl2.columns]
         if cols:
             sort_cols = [c for c in ['Strat', 'score_level2'] if c in lvl2.columns]
@@ -847,7 +847,7 @@ def display_satellite_selection(results_level2, quarter_selection_df, satellite_
     # 3) Snapshot final
     final_df = satellite_final_selection if isinstance(satellite_final_selection, pd.DataFrame) and not satellite_final_selection.empty else None
     if final_df is not None:
-        print(f"\n✅ Snapshot final le plus récent: {len(final_df)} lignes")
+        print(f"\n Snapshot final le plus récent: {len(final_df)} lignes")
         cols_f = [c for c in [
             'Strat', 'ticker', 'rank_in_strat', 'score_level2', 'selected_reason',
             'pair_corr', 'score_gap_vs_top1', 'Nom', 'Dev', 'Ratio des dépenses', 'Total actifs USD (M)'
@@ -1006,7 +1006,7 @@ def display_holdings_table(quarter_selection_df, review_freq_months=1):
 
     n_switches = df["switch_flag"].sum()
     n_periods = pivot.shape[0]
-    print(f"\n📋 Table des fonds détenus — révision {_freq_label} | {n_periods} périodes | {n_switches} switches (↓ cellules en jaune)")
+    print(f"\n Table des fonds détenus — révision {_freq_label} | {n_periods} périodes | {n_switches} switches (↓ cellules en jaune)")
     _display(
         pivot.style
         .apply(highlight_switches, axis=None)
