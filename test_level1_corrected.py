@@ -21,14 +21,14 @@ from satellite_level1_beta_filter_corrected import filter_level1_all_strats_corr
 
 def main():
     print("="*80)
-    print("🧪 TEST FILTRE NIVEAU 1 BETA CORRIGÉ (63j Multi-Statistics)")
+    print(" TEST FILTRE NIVEAU 1 BETA CORRIGÉ (63j Multi-Statistics)")
     print("="*80)
     
     # ────────────────────────────────────────────────────────────────────────────
     # Étape 1: Charger et préparer les données LEVEL 0
     # ────────────────────────────────────────────────────────────────────────────
     
-    print("\n1️⃣  Préparation Level 0 (Devise + AUM > 50M)...")
+    print("\n Préparation Level 0 (Devise + AUM > 50M)...")
     CALIB_START = "2019-01-01"
     CALIB_END = "2020-12-31"
     
@@ -39,7 +39,7 @@ def main():
         verbose=True
     )
     
-    print(f"\n   ✅ Level 0: {len(level0_df)} fonds")
+    print(f"\n  Level 0: {len(level0_df)} fonds")
     summary = level0_df.groupby('Strat').size()
     for strat, count in summary.items():
         print(f"      {strat}: {count}")
@@ -48,7 +48,7 @@ def main():
     # Étape 2: Charger et préparer les prix
     # ────────────────────────────────────────────────────────────────────────────
     
-    print("\n2️⃣  Chargement et prétraitement des prix (2019-2020)...")
+    print("\n Chargement et prétraitement des prix (2019-2020)...")
     df_prices_all = load_all_satellite_prices(data_dir="data")
     print(f"   Prices loaded: {df_prices_all.shape}")
     
@@ -59,23 +59,23 @@ def main():
         ffill_limit=5,
         min_obs=50
     )
-    print(f"   ✅ Prices calibration: {df_prices_calib.shape}")
+    print(f"  Prices calibration: {df_prices_calib.shape}")
     print(f"      Valid tickers: {len(valid_tickers)}")
     
     # ────────────────────────────────────────────────────────────────────────────
     # Étape 3: Charger Core returns (utilisé pour l'alignement)
     # ────────────────────────────────────────────────────────────────────────────
     
-    print("\n3️⃣  Chargement rendements Core...")
+    print("\n Chargement rendements Core...")
     try:
         core_returns_raw = pd.read_csv("outputs/core3_etf_daily_log_returns.csv", 
                                        index_col=0, parse_dates=True)
         # Moyenne simple
         core_returns_benchmark = core_returns_raw.mean(axis=1)
-        print(f"   ✅ Core returns: {len(core_returns_benchmark)} jours")
+        print(f"  Core returns: {len(core_returns_benchmark)} jours")
         print(f"      Période: {core_returns_benchmark.index[0].date()} à {core_returns_benchmark.index[-1].date()}")
     except FileNotFoundError:
-        print("   ℹ️  Core3 log returns non trouvés, génération dummy...")
+        print("   Core3 log returns non trouvés, génération dummy...")
         date_range = pd.date_range(CALIB_START, CALIB_END, freq='B')
         core_returns_benchmark = pd.Series(
             np.random.normal(0.0002, 0.01, len(date_range)),
@@ -87,20 +87,20 @@ def main():
     # Étape 4: Aligner les prix avec Core
     # ────────────────────────────────────────────────────────────────────────────
     
-    print("\n4️⃣  Alignement prix avec Core...")
+    print("\n Alignement prix avec Core...")
     df_prices_aligned, core_returns_aligned = align_prices_with_core(
         df_prices_calib,
         core_returns_benchmark,
         ffill_limit=5
     )
-    print(f"   ✅ Prices aligned: {df_prices_aligned.shape}")
+    print(f"  Prices aligned: {df_prices_aligned.shape}")
     print(f"      Core aligned: {len(core_returns_aligned)}")
     
     # ────────────────────────────────────────────────────────────────────────────
     # Étape 5: APPLIQUER LE FILTRE NIVEAU 1 CORRIGÉ
     # ────────────────────────────────────────────────────────────────────────────
     
-    print("\n5️⃣  APPLICATION FILTRE NIVEAU 1 CORRIGÉ (Beta 63j)...\n")
+    print("\n APPLICATION FILTRE NIVEAU 1 CORRIGÉ (Beta 63j)...\n")
     
     level1_df, results_df = filter_level1_all_strats_corrected(
         level0_df,
@@ -116,11 +116,11 @@ def main():
     # ────────────────────────────────────────────────────────────────────────────
     
     print("\n" + "="*80)
-    print("📊 RÉSULTATS FILTRE NIVEAU 1")
+    print(" RÉSULTATS FILTRE NIVEAU 1")
     print("="*80)
     
     if len(level1_df) > 0:
-        print(f"\n✅ {len(level1_df)} / {len(level0_df)} fonds PASSED")
+        print(f"\n {len(level1_df)} / {len(level0_df)} fonds PASSED")
         
         summary = level1_df.groupby('Strat').size()
         print(f"\nPar bloc:")
@@ -135,7 +135,7 @@ def main():
         ].head(10).to_string(index=False))
         
     else:
-        print(f"\n⚠️  AUCUN FOND N'A PASSÉ LE FILTRE")
+        print(f"\n  AUCUN FOND N'A PASSÉ LE FILTRE")
         
         # Afficher statistiques des échechs
         print(f"\nAnalyse des tests échoués:")
@@ -148,11 +148,11 @@ def main():
     
     # Sauvegarder les résultats
     results_df.to_csv("outputs/level1_beta_filter_results.csv", index=False)
-    print(f"✅ Résultats sauvegardés dans outputs/level1_beta_filter_results.csv")
+    print(f" Résultats sauvegardés dans outputs/level1_beta_filter_results.csv")
     
     if len(level1_df) > 0:
         level1_df.to_csv("outputs/level1_filtered_funds.csv", index=False)
-        print(f"✅ Fonds passés sauvegardés dans outputs/level1_filtered_funds.csv")
+        print(f" Fonds passés sauvegardés dans outputs/level1_filtered_funds.csv")
 
 
 if __name__ == "__main__":
