@@ -238,7 +238,7 @@ def apply_level1_filter_corrected(
         if passed:
             passed_tickers.append(ticker)
             if verbose and len(passed_tickers) <= 10:
-                print(f"   ✅ {ticker:25s} | med={median_abs_beta:.3f} q75={q75_abs_beta:.3f} ratio={pass_ratio:.1%}")
+                print(f"    {ticker:25s} | med={median_abs_beta:.3f} q75={q75_abs_beta:.3f} ratio={pass_ratio:.1%}")
 
     results_df = pd.DataFrame(results)
     level1_df = level0_df[level0_df[ticker_col].isin(passed_tickers)].copy()
