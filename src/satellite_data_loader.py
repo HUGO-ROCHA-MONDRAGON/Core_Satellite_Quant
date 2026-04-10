@@ -72,15 +72,15 @@ def load_all_satellite_prices(data_dir: str = "data") -> pd.DataFrame:
         try:
             df_prices = load_satellite_prices_wide(filepath)
             all_prices_list.append(df_prices)
-            print(f"✅ Chargé {filepath}: {df_prices.shape[1]} tickers")
+            print(f" Chargé {filepath}: {df_prices.shape[1]} tickers")
         except Exception as e:
-            print(f"⚠️  Erreur {filepath}: {e}")
+            print(f" Erreur {filepath}: {e}")
     
     # Combine tous les fichiers (union des tickers)
     df_all = pd.concat(all_prices_list, axis=1)
     df_all = df_all.sort_index()
     
-    print(f"\n✅ Total prix chargées: {df_all.shape[1]} tickers uniques, {df_all.shape[0]} dates")
+    print(f"\n Total prix chargées: {df_all.shape[1]} tickers uniques, {df_all.shape[0]} dates")
     print(f"   Période: {df_all.index[0].date()} à {df_all.index[-1].date()}")
     
     return df_all
@@ -108,10 +108,10 @@ def preprocess_prices(
     df_period = df_sorted.loc[start_date:end_date].copy()
     
     if len(df_period) == 0:
-        print(f"❌ Aucune donnée dans la période {start_date} à {end_date}")
+        print(f" Aucune donnée dans la période {start_date} à {end_date}")
         return pd.DataFrame(), []
     
-    print(f"\n📊 Prétraitement des prix ({start_date[:4]}-{end_date[:4]}):")
+    print(f"\n Prétraitement des prix ({start_date[:4]}-{end_date[:4]}):")
     print(f"   Période: {df_period.index[0].date()} à {df_period.index[-1].date()}")
     print(f"   Observations: {len(df_period)}")
     
@@ -143,7 +143,7 @@ def calculate_daily_returns(df_prices: pd.DataFrame) -> pd.DataFrame:
     """
     df_returns = np.log(df_prices / df_prices.shift(1)).dropna()
     
-    print(f"\n📈 Rendements log calculés: {df_returns.shape}")
+    print(f"\n Rendements log calculés: {df_returns.shape}")
     
     return df_returns
 
@@ -171,7 +171,7 @@ def align_prices_with_core(
     df_aligned = df_ffilled.loc[common_dates]
     core_aligned = core_returns.loc[common_dates]
     
-    print(f"\n🔗 Alignement avec Core:")
+    print(f"\n Alignement avec Core:")
     print(f"   Dates communes: {len(common_dates)}")
     print(f"   Tickers: {df_aligned.shape[1]}")
     
