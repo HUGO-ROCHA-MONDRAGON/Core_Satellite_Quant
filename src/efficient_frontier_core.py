@@ -587,7 +587,7 @@ def _weights_selection_dataframe(
     
     # Formater en pourcentage
     weights_df = weights_df.multiply(100).round(2)
-    weights_df = weights_df.applymap(lambda x: f"{x:.2f}%")
+    weights_df = weights_df.map(lambda x: f"{x:.2f}%")
     
     if output_csv:
         weights_df.to_csv(output_csv)
