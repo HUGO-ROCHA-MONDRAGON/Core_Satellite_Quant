@@ -81,25 +81,50 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
     sat_nav = (1.0 + sat_ret).cumprod()
     sat_dd = sat_nav / sat_nav.cummax() - 1.0
 
-    # Bloc contributions
+    # Bloc contributions (execution-aligned): same weight convention as sat_ret (w_exec).
     active = active_funds.copy()
     active['date'] = pd.to_datetime(active['date'], errors='coerce')
     active = active.dropna(subset=['date', 'bloc', 'ticker', 'weight_ticker']).copy()
     active = active[active['date'].isin(common_dates) & active['ticker'].isin(common_tickers)].copy()
+    ticker_to_bloc = active[['ticker', 'bloc']].drop_duplicates().set_index('ticker')['bloc'].to_dict()
 
+    w_exec_long = w_exec.stack().rename('w_exec').reset_index()
+    w_exec_long.columns = ['date', 'ticker', 'w_exec']
     ret_long = r.stack().rename('ret_ticker').reset_index()
     ret_long.columns = ['date', 'ticker', 'ret_ticker']
-    m = active.merge(ret_long, on=['date', 'ticker'], how='left')
-    missing_active_rows = int(m['ret_ticker'].isna().sum())
-    m = m.dropna(subset=['ret_ticker']).copy()
-    m['contrib_bloc'] = m['weight_ticker'] * m['ret_ticker']
-    bloc_contrib = m.groupby(['date', 'bloc'], as_index=False)['contrib_bloc'].sum()
+
+    contrib_long = w_exec_long.merge(ret_long, on=['date', 'ticker'], how='left')
+    contrib_long['bloc'] = contrib_long['ticker'].map(ticker_to_bloc)
+    contrib_long = contrib_long[contrib_long['bloc'].isin(['bloc1', 'bloc2', 'bloc3'])].copy()
+    missing_active_rows = int(
+        ((contrib_long['w_exec'].abs() > 1e-12) & contrib_long['ret_ticker'].isna()).sum()
+    )
+    contrib_long['contrib_bloc'] = contrib_long['w_exec'] * contrib_long['ret_ticker'].fillna(0.0)
+
+    bloc_contrib = contrib_long.groupby(['date', 'bloc'], as_index=False)['contrib_bloc'].sum()
     bloc_contrib_piv = bloc_contrib.pivot(index='date', columns='bloc', values='contrib_bloc').fillna(0.0)
     for b in ['bloc1', 'bloc2', 'bloc3']:
         if b not in bloc_contrib_piv.columns:
             bloc_contrib_piv[b] = 0.0
     bloc_contrib_piv = bloc_contrib_piv[['bloc1', 'bloc2', 'bloc3']].sort_index()
-    bloc_cum_contrib = bloc_contrib_piv.cumsum()
+    bloc_contrib_piv = bloc_contrib_piv.reindex(common_dates).fillna(0.0)
+
+    # Keep only valid Satellite-return days so decomposition matches displayed returns.
+    sat_ret_valid = sat_ret.dropna().sort_index()
+    bloc_contrib_valid = bloc_contrib_piv.reindex(sat_ret_valid.index).fillna(0.0)
+    recon_error = (
+        (bloc_contrib_valid.sum(axis=1) - sat_ret_valid).abs().max()
+        if len(sat_ret_valid) > 0
+        else 0.0
+    )
+
+    # Linked cumulative contributions: sum across blocs equals cumulative Satellite return.
+    bloc_cum_contrib = pd.DataFrame(index=sat_ret_valid.index, columns=['bloc1', 'bloc2', 'bloc3'], dtype=float)
+    running_contrib = pd.Series(0.0, index=['bloc1', 'bloc2', 'bloc3'])
+    for dt in sat_ret_valid.index:
+        r_t = float(sat_ret_valid.loc[dt])
+        running_contrib = (1.0 + r_t) * running_contrib + bloc_contrib_valid.loc[dt]
+        bloc_cum_contrib.loc[dt] = running_contrib.values
 
     # Metrics
     sat_metrics = pd.DataFrame({
@@ -109,8 +134,23 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
         'Max DD': [sat_dd.min()],
     }, index=['Satellite dynamique'])
 
-    ann_sat = sat_ret.groupby(sat_ret.index.year).apply(lambda x: (1.0 + x).prod() - 1.0)
-    ann_bloc_contrib = bloc_contrib_piv.groupby(bloc_contrib_piv.index.year).sum()
+    ann_sat = sat_ret_valid.groupby(sat_ret_valid.index.year).apply(lambda x: (1.0 + x).prod() - 1.0)
+
+    # Annual linked contributions:
+    # C_{bloc,year} = sum_t c_{bloc,t} * prod_{u>t}(1+r_u), so sum_bloc C = annual return.
+    ann_bloc_rows = []
+    for year, c_year in bloc_contrib_valid.groupby(bloc_contrib_valid.index.year):
+        r_year = sat_ret_valid.loc[c_year.index]
+        future_growth = (1.0 + r_year.iloc[::-1]).cumprod().iloc[::-1].shift(-1).fillna(1.0)
+        linked_contrib = c_year.mul(future_growth, axis=0).sum()
+        linked_contrib.name = int(year)
+        ann_bloc_rows.append(linked_contrib)
+    ann_bloc_contrib = (
+        pd.DataFrame(ann_bloc_rows)[['bloc1', 'bloc2', 'bloc3']]
+        if len(ann_bloc_rows) > 0
+        else pd.DataFrame(columns=['bloc1', 'bloc2', 'bloc3'])
+    )
+    ann_bloc_contrib.index.name = 'date'
 
     beta_window = 504  # 2 ans
     beta_min_p = 63
@@ -127,8 +167,10 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
     }))
     print('\nReturns annuels Satellite :')
     display(ann_sat.to_frame('ret_ann').style.format('{:+.2%}'))
-    print('\nContribution annuelle par bloc :')
+    print('\nContribution annuelle par bloc (liée, somme = return annuel Satellite) :')
     display(ann_bloc_contrib.style.format('{:+.2%}'))
+    if recon_error > 1e-10:
+        print(f"\nWARNING: écart max journalier décomposition vs sat_ret = {recon_error:.6%}")
     n_missing_days = int((missing_sat_weight > 1e-12).sum())
     if n_missing_days > 0:
         print(f"\nJours exclus (retours fonds manquants avec exposition active): {n_missing_days}")

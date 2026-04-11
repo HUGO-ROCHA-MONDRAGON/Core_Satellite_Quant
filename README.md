@@ -194,19 +194,23 @@ Le portefeuille Satellite adapte son allocation interne (poids des 3 blocs) au *
 
 ### Construction de l'indicateur
 
-L'indicateur de régime est composite, construit à partir de 3 métriques rolling sur les rendements du Core (pondérés par les poids de la stratégie sélectionnée, nets de TER) :
+L'indicateur de régime est composite, construit à partir de 4 métriques rolling sur les rendements du Core (pondérés par les poids de la stratégie sélectionnée, nets de TER) :
 
 1. **Volatilité rolling 63 jours** ($\sigma_{63}$) : mesure de la turbulence récente
-2. **Corrélation rolling equity-bonds 63 jours** ($\rho_{eq,bonds}$) : quand cette corrélation monte, les actifs sont entraînés ensemble — signe de stress
-3. **Momentum rolling 63 jours** ($mom_{63}$) : rendement cumulé sur 63 jours — un momentum négatif signale une tendance baissière
+2. **Corrélation rolling equity-bonds 63 jours** ($\rho_{eq,bonds}$) : quand cette corrélation monte, les actifs sont entraînés ensemble, signe de stress
+3. **Momentum rolling 63 jours** ($mom_{63}$) : rendement cumulé sur 63 jours, un momentum négatif signale une tendance baissière
+4. **Drawdown rolling 63 jours** ($dd_{63}$) : profondeur de perte récente du Core
 
 ### Score de régime
 
-Chaque indicateur est converti en **z-score rolling** (fenêtre 315 jours, minimum 189 observations) pour le rendre comparable dans le temps. Le score de régime est ensuite :
+Chaque indicateur est converti en **z-score rolling** (fenêtre 315 jours, minimum 189 observations) pour le rendre comparable dans le temps. Le score de régime est pondéré :
 
-$$RegimeScore(t) = z_{vol}(t-1) + z_{corr}(t-1) - z_{mom}(t-1)$$
+$$RegimeScore_{raw}(t) = w_{vol} z_{vol}(t) + w_{corr} z_{corr}(t) - w_{mom} z_{mom}(t) - w_{dd} z_{dd}(t)$$
+$$RegimeScore(t) = RegimeScore_{raw}(t-1)$$
 
-**Interprétation** : un score élevé → vol élevée, corrélation élevée, momentum négatif → stress. Un score faible → le contraire → risk-on.
+Les poids $(w_{vol}, w_{corr}, w_{mom}, w_{dd})$ sont issus de `regime_cfg` (configuration optimisée sur IS).
+
+**Interprétation** : un score élevé indique typiquement vol/corr élevées, momentum faible et drawdown dégradé, donc un contexte plus stressé.
 
 Le **décalage de 1 jour** sur toutes les composantes (shift) assure la causalité : le score à la date $t$ ne dépend que de données jusqu'à $t-1$.
 
@@ -233,7 +237,9 @@ Pour éviter le *signal whipsaw* (oscillations rapides entre régimes), un **lis
 
 ### Optimisation sous grille
 
-Les paramètres de régime (fenêtres d'indicateurs, de z-score, de seuils, quantiles) sont optimisés par **grid search** sur la période IS. L'objectif est de trouver la combinaison qui maximise une métrique de cohérence économique (ex. : le régime Stress doit effectivement correspondre à des périodes de vol élevée et drawdown important).
+Les paramètres de régime (fenêtres d'indicateurs, de z-score, de seuils, quantiles, poids de score) sont optimisés par **grid search**.  
+Par défaut, la sélection de la meilleure configuration est faite en **mode IS-only** pour préserver l'OOS comme vrai holdout (pas de data snooping).  
+Un mode legacy mixte IS/OOS existe uniquement pour analyse de sensibilité et comparaison historique.
 
 ---
 
@@ -460,17 +466,22 @@ Les poids sont pris **au jour t−1** pour éviter le look-ahead : on utilise le
 
 Pour chaque bloc, la contribution quotidienne est :
 
-$$contrib_{bloc}(t) = \sum_{i \in bloc} w_i(t) \times r_i(t)$$
+$$contrib_{bloc}(t) = \sum_{i \in bloc} w_i(t-1) \times r_i(t)$$
 
-Cela permet d'identifier quel bloc est le moteur de la performance Satellite — et si la logique d'allocation par régime ajoute effectivement de la valeur.
+La convention de poids est la même que pour le rendement Satellite (poids exécutés `t-1`).  
+Pour l'analyse annuelle, les contributions sont **liées** (linked contributions) afin que la somme des blocs reproduise exactement le rendement annuel Satellite :
+
+$$C_{bloc,an} = \sum_{t \in an} c_{bloc,t} \times \prod_{u>t}(1 + r_{sat,u})$$
+
+Ainsi, $\sum_{bloc} C_{bloc,an} = R_{sat,an}$.
 
 ### Métriques sur le Satellite
 
 On calcule :
 - NAV cumulée du Satellite
 - Drawdown glissant
-- Volatilité rolling 63 jours
-- Bêta rolling vs Core
+- Volatilité rolling 504 jours (min 63 obs)
+- Bêta rolling vs Core (504 jours, min 63 obs)
 - Rendement annualisé, Sharpe, Calmar
 
 ---
@@ -483,7 +494,19 @@ Le rendement Core utilisé pour la comparaison provient de la **NAV simulée du 
 
 ### Source des rendements Satellite
 
-Le rendement Satellite est celui calculé à la section 13. Les poids Satellite t−1 sont appliqués aux rendements de prix t, avec un recouvrement sur les dates communes Core/Satellite.
+Le rendement Satellite est celui calculé à la section 13. Les poids Satellite t−1 sont appliqués aux rendements de prix t.
+
+### Conventions de comparaison (3 vues)
+
+Le pipeline supporte 3 conventions explicites pour éviter toute ambiguïté d'interprétation :
+
+| Mode | Règle | Usage |
+|------|-------|-------|
+| `strict_comparable` | On ne conserve que les jours où Core et Satellite sont tous deux observables | Mesures comparatives strictes (alpha, bêta, corrélation, tracking error) |
+| `investable_stale_satellite` | On conserve les jours Core; les jours Satellite manquants sont imputés à 0 (convention "stale NAV") | Vue investissable portefeuille |
+| `global_fill0_legacy` | Convention historique: calcul Satellite avec retours ticker manquants remplacés par 0, puis alignement global | Reproduction de la version initiale pour comparaison |
+
+Les sorties incluent une table de **couverture** (jours comparables, taux de couverture, jours Core hors commun, jours Satellite manquants avec exposition active) afin d'évaluer la qualité statistique de la comparaison.
 
 ### Métriques comparatives
 
@@ -493,21 +516,22 @@ Le rendement Satellite est celui calculé à la section 13. Les poids Satellite 
 | Corrélation statique | Corrélation linéaire sur toute la période |
 | Tracking error | Écart-type annualisé de $r_{satellite} - r_{core}$ |
 | Alpha annualisé | Rendement excédentaire du Satellite après neutralisation du bêta |
-| Bêta rolling 63 jours | Évolution du bêta dans le temps (vérifie que la décorrélation tient en OOS) |
-| Corrélation rolling 63 et 126 jours | Évolution de la corrélation |
-| Alpha rolling | Détection de périodes où le Satellite génère ou détruit de l'alpha |
+| Bêta rolling 504 jours (min 63) | Évolution lente et robuste du bêta dans le temps |
+| Corrélation rolling 504 jours (min 63) | Évolution lente et robuste de la corrélation |
+| Alpha rolling 504 jours (min 63) | Détection de périodes persistantes de création/destruction d'alpha |
+| Couverture de comparaison | Qualité de recouvrement entre historique Core et historique Satellite |
 
 ### Dashboard 8 panneaux
 
 L'analyse produit 8 graphiques :
 1. NAV cumulée Core vs Satellite
 2. Drawdown comparé
-3. Bêta rolling 63j et 126j
-4. Corrélation rolling 63j et 126j
-5. Alpha rolling 63j et 126j
-6. Rendements annuels comparés
-7. Cross-métriques (Sharpe, Max DD, Calmar)
-8. Scatter plot rendements quotidiens
+3. Vol rolling 504j annualisée
+4. Encart convention de calcul + couverture
+5. Bêta rolling 504j
+6. Corrélation rolling 504j
+7. Alpha rolling 504j
+8. Rendements annuels + alpha
 
 ---
 

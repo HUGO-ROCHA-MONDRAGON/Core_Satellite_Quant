@@ -947,6 +947,14 @@ def display_alpha_interpretation(cvs_results):
     beta_static = cvs_results["beta_static"]
     alpha_ann_total = cvs_results["alpha_ann_total"]
     tracking_error = cvs_results["tracking_error"]
+    portfolio_input_mode = str(cvs_results.get("portfolio_input_mode", "strict_comparable")).strip().lower()
+
+    if portfolio_input_mode == "investable_stale_satellite":
+        core_label = "Core (investable)"
+    elif portfolio_input_mode == "global_fill0_legacy":
+        core_label = "Core (global fill0)"
+    else:
+        core_label = "Core (aligné)"
 
     sat_total = ann_return(ret_cmp["satellite"])
     core_total = ann_return(ret_cmp["core"])
@@ -962,7 +970,7 @@ def display_alpha_interpretation(cvs_results):
     print(f"\n1) CAPM Alpha : Beta = {beta_static:.4f}")
     print("\n2) Simple Outperformance :")
     print(
-        f"   Satellite : {sat_total:+.2%} | Core (aligné) : {core_total:+.2%} "
+        f"   Satellite : {sat_total:+.2%} | {core_label} : {core_total:+.2%} "
         f"| Diff : {simple_outperformance:+.2%}"
     )
     print(f"   → {'UNDERPERFORMANCE' if simple_outperformance < 0 else 'OUTPERFORMANCE'}")
