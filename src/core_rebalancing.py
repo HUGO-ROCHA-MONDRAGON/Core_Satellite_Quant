@@ -302,7 +302,8 @@ class CoreRebalancer:
         diff_ret = ret_rebal - ret_static
         
         # Tracking error annualisée
-        tracking_error = np.std(diff_ret) * np.sqrt(252)
+        # Use sample standard deviation (ddof=1) for consistency with pandas .std()
+        tracking_error = np.std(diff_ret, ddof=1) * np.sqrt(252)
         
         # Impact cumulé
         cumulative_impact = (port_with_rebal[-1] / port_static[-1] - 1) * 100

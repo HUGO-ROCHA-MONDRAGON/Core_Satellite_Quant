@@ -77,11 +77,11 @@ def run_core_simulation(strategies, core_3_log, core_df, CORE_TICKERS, config_co
     tx_rows = []
 
     if rebalance_df is not None and len(rebalance_df) > 0:
-        gross_values = portfolio_df['portfolio_value_gross'].values
+        gross_values = portfolio_df['portfolio_value_gross'].values.astype(float)
         dates = portfolio_df.index
         tx_cost_rates = np.zeros(len(portfolio_df), dtype=float)
         tx_cost_values = np.zeros(len(portfolio_df), dtype=float)
-        net_values = gross_values.copy()
+        net_values = np.zeros(len(portfolio_df), dtype=float)
 
         rebalance_lookup = {}
         for _, row in rebalance_df.iterrows():
@@ -99,10 +99,16 @@ def run_core_simulation(strategies, core_3_log, core_df, CORE_TICKERS, config_co
             rebalance_lookup[dt] = max(event_cost_pct, 0.0)
 
         for i, d in enumerate(dates):
-            val_before_cost = gross_values[i]
             event_cost_pct = rebalance_lookup.get(pd.Timestamp(d), 0.0)
-            event_cost_value = val_before_cost * event_cost_pct
-            net_values[i] = val_before_cost - event_cost_value
+            if i == 0:
+                nav_before_cost = gross_values[i]
+            else:
+                prev_gross = gross_values[i - 1]
+                gross_growth = (gross_values[i] / prev_gross) if prev_gross > 0 else 1.0
+                nav_before_cost = net_values[i - 1] * gross_growth
+
+            event_cost_value = nav_before_cost * event_cost_pct
+            net_values[i] = nav_before_cost - event_cost_value
             tx_cost_values[i] = event_cost_value
             tx_cost_rates[i] = event_cost_pct
 

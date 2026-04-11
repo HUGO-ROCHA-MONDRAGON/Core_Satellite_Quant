@@ -587,7 +587,8 @@ def _weights_selection_dataframe(
     
     # Formater en pourcentage
     weights_df = weights_df.multiply(100).round(2)
-    weights_df = weights_df.map(lambda x: f"{x:.2f}%")
+    # DataFrame.map is not available on all pandas versions; use applymap for compatibility.
+    weights_df = weights_df.applymap(lambda x: f"{x:.2f}%")
     
     if output_csv:
         weights_df.to_csv(output_csv)
@@ -727,8 +728,10 @@ def main(
               f"{row['IS_sharpe']:>7.2f} {row['OOS_ret_ann']:>8.1%} "
               f"{row['OOS_vol_ann']:>8.1%} {row['OOS_sharpe']:>7.2f} {row['OOS_mdd']:>8.1%}")
 
-    best = comp_df["OOS_sharpe"].idxmax()
-    print(f"\n  ★  Meilleure stratégie OOS (Sharpe exces rf) : {best}")
+    best_is = comp_df["IS_sharpe"].idxmax()
+    best_oos = comp_df["OOS_sharpe"].idxmax()
+    print(f"\n  ★  Meilleure stratégie IS (Sharpe exces rf) : {best_is}")
+    print(f"  ℹ  Meilleure stratégie OOS (diagnostic)      : {best_oos}")
 
     # ── Poids de sélection ─────────────────────────────────────────────────
     weights_df = _weights_selection_dataframe(strategies, tickers)

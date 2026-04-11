@@ -61,7 +61,7 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
     prices_all.index = pd.DatetimeIndex(prices_all.index).tz_localize(None)
 
     rets_all = prices_all.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna(how='all')
-    core_ret_all = core_nav.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    core_ret_all = core_nav.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
 
     common_dates = w_ticker.index.intersection(rets_all.index).intersection(core_ret_all.index)
     common_dates = common_dates[(common_dates >= analysis_start) & (common_dates <= analysis_end)]
@@ -71,11 +71,13 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
         raise ValueError("Aucune intersection dates/tickers.")
 
     w = w_ticker.loc[common_dates, common_tickers].fillna(0.0)
-    r = rets_all.loc[common_dates, common_tickers].fillna(0.0)
-    core_ret = core_ret_all.loc[common_dates].fillna(0.0)
+    r = rets_all.loc[common_dates, common_tickers]
+    core_ret = core_ret_all.loc[common_dates]
 
     w_exec = w.shift(1).fillna(0.0)
-    sat_ret = (w_exec * r).sum(axis=1)
+    missing_sat_weight = w_exec.where(r.isna(), 0.0).sum(axis=1)
+    sat_ret = (w_exec * r.fillna(0.0)).sum(axis=1)
+    sat_ret = sat_ret.mask(missing_sat_weight > 1e-12)
     sat_nav = (1.0 + sat_ret).cumprod()
     sat_dd = sat_nav / sat_nav.cummax() - 1.0
 
@@ -88,7 +90,8 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
     ret_long = r.stack().rename('ret_ticker').reset_index()
     ret_long.columns = ['date', 'ticker', 'ret_ticker']
     m = active.merge(ret_long, on=['date', 'ticker'], how='left')
-    m['ret_ticker'] = m['ret_ticker'].fillna(0.0)
+    missing_active_rows = int(m['ret_ticker'].isna().sum())
+    m = m.dropna(subset=['ret_ticker']).copy()
     m['contrib_bloc'] = m['weight_ticker'] * m['ret_ticker']
     bloc_contrib = m.groupby(['date', 'bloc'], as_index=False)['contrib_bloc'].sum()
     bloc_contrib_piv = bloc_contrib.pivot(index='date', columns='bloc', values='contrib_bloc').fillna(0.0)
@@ -126,6 +129,11 @@ def analyze_satellite_dynamic(weights_ticker_daily, block_weights_daily, active_
     display(ann_sat.to_frame('ret_ann').style.format('{:+.2%}'))
     print('\nContribution annuelle par bloc :')
     display(ann_bloc_contrib.style.format('{:+.2%}'))
+    n_missing_days = int((missing_sat_weight > 1e-12).sum())
+    if n_missing_days > 0:
+        print(f"\nJours exclus (retours fonds manquants avec exposition active): {n_missing_days}")
+    if missing_active_rows > 0:
+        print(f"Lignes contribution ignorées (retour ticker manquant): {missing_active_rows}")
     print(f'\nFenêtre : {common_dates.min().date()} → {common_dates.max().date()} ({len(common_dates)} obs)')
     print(f'Beta rolling moyen: {sat_beta_rolling.mean():.3f} | '
           f'min: {sat_beta_rolling.min():.3f} | max: {sat_beta_rolling.max():.3f}')

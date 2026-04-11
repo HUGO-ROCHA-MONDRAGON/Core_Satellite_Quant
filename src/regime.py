@@ -275,8 +275,20 @@ def optimize_regime_cfg(daily_returns_df, core_tickers, core_equity, core_rates,
                         core_weights, core_ter_map_pct, regime_cfg):
     """
     Grid-search over regime parameters. Returns (res_df, best_regime_cfg, best_row).
+
+    By default, parameter selection is IS-only (selection_mode="is_only") to
+    preserve OOS as a true holdout. Legacy mixed scoring can be re-enabled with
+    selection_mode="legacy_is_oos_mix".
     """
     t0 = time.perf_counter()
+
+    selection_mode = str(regime_cfg.get("selection_mode", "is_only")).strip().lower()
+    valid_selection_modes = {"is_only", "legacy_is_oos_mix"}
+    if selection_mode not in valid_selection_modes:
+        raise ValueError(
+            f"selection_mode inconnu: {selection_mode}. "
+            "Utiliser 'is_only' ou 'legacy_is_oos_mix'."
+        )
 
     fixed_is_start = regime_cfg["is_start"]
     fixed_is_end = regime_cfg["is_end"]
@@ -376,11 +388,35 @@ def optimize_regime_cfg(daily_returns_df, core_tickers, core_equity, core_rates,
         df["Regime"] = apply_min_regime_days_causal(df["Regime_raw"], min_days=min_days)
 
         met_is = evaluate_period_quality(df, is_mask_global)
-        met_oos = evaluate_period_quality(df, oos_mask_global)
-        if not met_is["ok"] or not met_oos["ok"]:
+        if not met_is["ok"]:
             continue
 
-        global_score = 0.35 * met_is["score"] + 0.65 * met_oos["score"]
+        met_oos = evaluate_period_quality(df, oos_mask_global)
+        if met_oos["ok"]:
+            legacy_mixed_score = 0.35 * met_is["score"] + 0.65 * met_oos["score"]
+        else:
+            legacy_mixed_score = np.nan
+            met_oos = {
+                "ok": False,
+                "score": np.nan,
+                "ret_order_ok": np.nan,
+                "vol_order_ok": np.nan,
+                "ret_gap": np.nan,
+                "vol_gap": np.nan,
+                "stress_capture": np.nan,
+                "riskon_capture": np.nan,
+                "switches_per_year": np.nan,
+                "pct_stress": np.nan,
+                "pct_neutre": np.nan,
+                "pct_riskon": np.nan,
+            }
+
+        if selection_mode == "legacy_is_oos_mix":
+            if not np.isfinite(legacy_mixed_score):
+                continue
+            score_selection = float(legacy_mixed_score)
+        else:
+            score_selection = float(met_is["score"])
 
         results.append({
             "indicator_window_months": ind_m,
@@ -397,9 +433,12 @@ def optimize_regime_cfg(daily_returns_df, core_tickers, core_equity, core_rates,
             "w_corr": w_corr,
             "w_mom": w_mom,
             "w_dd": w_dd,
+            "selection_mode": selection_mode,
             "score_is": met_is["score"],
             "score_oos": met_oos["score"],
-            "score_global": global_score,
+            "score_selection": score_selection,
+            "score_global": score_selection,  # compatibility alias
+            "score_global_legacy": legacy_mixed_score,
             "ret_order_oos": met_oos["ret_order_ok"],
             "vol_order_oos": met_oos["vol_order_ok"],
             "stress_capture_oos": met_oos["stress_capture"],
@@ -413,7 +452,7 @@ def optimize_regime_cfg(daily_returns_df, core_tickers, core_equity, core_rates,
     if not results:
         raise RuntimeError("Aucune combinaison valide. Elargir la grille ou verifier les donnees.")
 
-    res_df = pd.DataFrame(results).sort_values("score_global", ascending=False).reset_index(drop=True)
+    res_df = pd.DataFrame(results).sort_values("score_selection", ascending=False).reset_index(drop=True)
     best = res_df.iloc[0]
 
     best_regime_cfg = {
@@ -431,10 +470,14 @@ def optimize_regime_cfg(daily_returns_df, core_tickers, core_equity, core_rates,
         "w_corr": float(best["w_corr"]),
         "w_mom": float(best["w_mom"]),
         "w_dd": float(best["w_dd"]),
+        "selection_mode": selection_mode,
     }
 
     elapsed = time.perf_counter() - t0
-    print(f"Optimisation terminée: {len(combos)} combinaisons en {elapsed:.2f}s ({len(combos) / elapsed:.1f}/s)")
+    print(
+        f"Optimisation terminée: {len(combos)} combinaisons en {elapsed:.2f}s "
+        f"({len(combos) / elapsed:.1f}/s) | selection_mode={selection_mode}"
+    )
 
     return res_df, best_regime_cfg, best
 
@@ -510,6 +553,8 @@ def display_regime_optimization(res_df, best_regime_cfg, best):
     """Display optimization results: top 10, best config details, OOS quality metrics."""
     from IPython.display import display as _display
 
+    score_col = "score_selection" if "score_selection" in res_df.columns else "score_global"
+
     print("\n" + "=" * 90)
     print("OPTIMISATION REGIME_CFG (qualitative, sans forward-looking)")
     print("=" * 90)
@@ -518,10 +563,11 @@ def display_regime_optimization(res_df, best_regime_cfg, best):
         'indicator_window_months', 'zscore_window_months', 'rolling_threshold_months',
         'zscore_min_periods', 'threshold_low_q', 'threshold_high_q', 'min_regime_days',
         'w_vol', 'w_corr', 'w_mom', 'w_dd',
-        'score_is', 'score_oos', 'score_global', 'ret_order_oos', 'vol_order_oos',
+        'score_is', 'score_oos', score_col, 'ret_order_oos', 'vol_order_oos',
         'stress_capture_oos', 'riskon_capture_oos', 'switches_per_year_oos'
     ]
-    print("\nTop 10 configurations (score_global):")
+    cols_show = [c for c in cols_show if c in res_df.columns]
+    print(f"\nTop 10 configurations ({score_col}):")
     _display(res_df[cols_show].head(10))
 
     print("\nMeilleure configuration recommandee (IS/OOS fixes):")
@@ -535,16 +581,31 @@ def display_regime_optimization(res_df, best_regime_cfg, best):
             continue
         print(f"  {k}: {v}")
 
+    def _fmt_bool(v):
+        if pd.isna(v):
+            return "N/A"
+        return str(bool(v))
+
+    def _fmt_pct(v):
+        if pd.isna(v):
+            return "N/A"
+        return f"{v:.1%}"
+
+    def _fmt_num(v):
+        if pd.isna(v):
+            return "N/A"
+        return f"{v:.1f}"
+
     print("\nQualite OOS de la meilleure config:")
-    print(f"  score_oos           : {best['score_oos']:.3f}")
-    print(f"  ret_order_oos       : {bool(best['ret_order_oos'])}")
-    print(f"  vol_order_oos       : {bool(best['vol_order_oos'])}")
-    print(f"  stress_capture_oos  : {best['stress_capture_oos']:.1%}")
-    print(f"  riskon_capture_oos  : {best['riskon_capture_oos']:.1%}")
-    print(f"  switches/year OOS   : {best['switches_per_year_oos']:.1f}")
+    print(f"  score_oos           : {best['score_oos']:.3f}" if pd.notna(best.get("score_oos")) else "  score_oos           : N/A")
+    print(f"  ret_order_oos       : {_fmt_bool(best.get('ret_order_oos'))}")
+    print(f"  vol_order_oos       : {_fmt_bool(best.get('vol_order_oos'))}")
+    print(f"  stress_capture_oos  : {_fmt_pct(best.get('stress_capture_oos'))}")
+    print(f"  riskon_capture_oos  : {_fmt_pct(best.get('riskon_capture_oos'))}")
+    print(f"  switches/year OOS   : {_fmt_num(best.get('switches_per_year_oos'))}")
     print(
         "  repartition OOS     : "
-        f"Stress={best['pct_stress_oos']:.1%}, "
-        f"Neutre={best['pct_neutre_oos']:.1%}, "
-        f"Risk-on={best['pct_riskon_oos']:.1%}"
+        f"Stress={_fmt_pct(best.get('pct_stress_oos'))}, "
+        f"Neutre={_fmt_pct(best.get('pct_neutre_oos'))}, "
+        f"Risk-on={_fmt_pct(best.get('pct_riskon_oos'))}"
     )
